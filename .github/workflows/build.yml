@@ -27,7 +27,7 @@ jobs:
           rm -rf android
           flutter create --platforms=android --org com.ryontaso.wikilinks .
           
-          # 1. build.gradle.kts を直接編集して compileSdk を 37 に指定
+          # 1. build.gradle.kts を編集して compileSdk を 37 に指定
           python3 -c "
           path = 'android/app/build.gradle.kts'
           with open(path, 'r') as f:
@@ -47,25 +47,35 @@ jobs:
           # 2. gradle.properties に AAR 検査抑制フラグを注入
           echo 'android.suppressUnsupportedCompileSdk=37' >> android/gradle.properties
 
-          # 3. AndroidManifest.xml に「インターネット通信許可」と「共有アンテナ」を両方注入
+          # 3. AndroidManifest.xml に「通信許可」「共有メニュー」「Wikipedia直通リンク（ディープリンク）」を注入
           python3 -c "
           path = 'android/app/src/main/AndroidManifest.xml'
           with open(path, 'r') as f:
               content = f.read()
 
-          # インターネット通信権限の付与
+          # インターネット通信権限
           perm = '<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n    <uses-permission android:name=\"android.permission.INTERNET\"/>\n'
           new_content = content.replace('<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">', perm)
 
-          # 共有メニュー（SENDインテント）の追加
-          intent = '''
+          # 共有メニュー受け取り ＋ Wikipediaリンク直接起動フィルター
+          filters = '''
+                      <!-- 共有メニューからの受け取り -->
                       <intent-filter>
                           <action android:name=\"android.intent.action.SEND\" />
                           <category android:name=\"android.intent.category.DEFAULT\" />
                           <data android:mimeType=\"text/plain\" />
                       </intent-filter>
+
+                      <!-- ブラウザ等でWikipediaリンクを踏んだ時の直接起動 -->
+                      <intent-filter android:autoVerify=\"true\">
+                          <action android:name=\"android.intent.action.VIEW\" />
+                          <category android:name=\"android.intent.category.DEFAULT\" />
+                          <category android:name=\"android.intent.category.BROWSABLE\" />
+                          <data android:scheme=\"https\" android:host=\"ja.wikipedia.org\" android:pathPrefix=\"/wiki/\" />
+                          <data android:scheme=\"https\" android:host=\"ja.m.wikipedia.org\" android:pathPrefix=\"/wiki/\" />
+                      </intent-filter>
                   </activity>'''
-          new_content = new_content.replace('</activity>', intent)
+          new_content = new_content.replace('</activity>', filters)
 
           with open(path, 'w') as f:
               f.write(new_content)
