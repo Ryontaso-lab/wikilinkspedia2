@@ -104,7 +104,6 @@ class _MainScreenState extends State<MainScreen> {
         th {
           background-color: #334155 !important;
         }
-        /* 画像や地図は色反転させずに保護 */
         img, svg, canvas, .leaflet-container {
           filter: brightness(0.9) contrast(1.05) !important;
         }
@@ -113,7 +112,6 @@ class _MainScreenState extends State<MainScreen> {
     })();
   ''';
 
-  // ライトモード復帰用スクリプト
   static const String _removeDarkCss = '''
     (function() {
       var style = document.getElementById('flutter-wiki-dark-theme');
@@ -421,7 +419,8 @@ class _ConstellationModalState extends State<ConstellationModal> {
     final count = widget.links.length;
 
     for (int i = 0; i < count; i++) {
-      final rad = (i / count) * math.PI * 2;
+      // math.pi に修正
+      final rad = (i / count) * math.pi * 2;
       final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.05);
       final dist = baseDist + offset;
 
