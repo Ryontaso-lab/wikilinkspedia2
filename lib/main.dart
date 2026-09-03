@@ -74,7 +74,7 @@ class _MainScreenState extends State<MainScreen> {
   String _currentTitle = '読み込み中...';
   final List<HistoryItem> _history = [];
   int _currentHistoryIdx = -1;
-  List<String> _starLinks = [];
+  List<ConstellationItem> _starNodes = [];
   int _targetRestoreScrollY = 0;
   int _latestReportedScrollY = 0;
 
@@ -190,7 +190,6 @@ class _MainScreenState extends State<MainScreen> {
           onPageFinished: (String url) {
             _applyThemeToWebView();
 
-            // スクロール追跡用リスナー注入
             _webCtrl.runJavaScript('''
               window.removeEventListener('scroll', window._flutterScrollDebounce);
               window._flutterScrollDebounce = function() {
@@ -201,7 +200,6 @@ class _MainScreenState extends State<MainScreen> {
               window.addEventListener('scroll', window._flutterScrollDebounce, { passive: true });
             ''');
 
-            // スクロール位置の段階的確実復元（DOM構築完了までリトライ）
             if (_targetRestoreScrollY > 0) {
               final targetY = _targetRestoreScrollY;
               _targetRestoreScrollY = 0;
@@ -284,32 +282,30 @@ class _MainScreenState extends State<MainScreen> {
       });
     }
 
-    _fetchConstellationLinks(title);
+    _fetchVerifiedConstellation(title);
   }
 
-  // 「具体（本文リンク）」と「抽象（大カテゴリー）」を融合して取得
-  Future<void> _fetchConstellationLinks(String title) async {
+  // 実在確認付きの上位概念（抽象）と下位概念（具体）の精製取得
+  Future<void> _fetchVerifiedConstellation(String title) async {
     try {
-      // 1. カテゴリ（抽象・大きな枠組み）を取得
       final catUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&prop=categories&cllimit=30&format=json&titles=${Uri.encodeComponent(title)}'
+        'https://ja.wikipedia.org/w/api.php?action=query&prop=categories&cllimit=40&format=json&titles=${Uri.encodeComponent(title)}'
       );
-      // 2. 本文リンク（具体・下位トピック）を取得
       final linkUrl = Uri.parse(
         'https://ja.wikipedia.org/w/api.php?action=query&prop=links&plnamespace=0&pllimit=150&format=json&titles=${Uri.encodeComponent(title)}'
       );
 
-      final responses = await Future.wait([
+      final resList = await Future.wait([
         http.get(catUrl, headers: _apiHeaders),
         http.get(linkUrl, headers: _apiHeaders),
       ]);
 
-      final List<String> abstractNodes = [];
-      final List<String> concreteNodes = [];
+      final List<String> rawAbstractCandidates = [];
+      final List<String> rawConcreteCandidates = [];
 
-      // 抽象ノード抽出（カテゴリの整理）
-      if (responses[0].statusCode == 200) {
-        final data = json.decode(responses[0].body);
+      // 1. 上位候補（カテゴリから管理タグを除いた名詞）
+      if (resList[0].statusCode == 200) {
+        final data = json.decode(resList[0].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
         if (pages != null && pages.isNotEmpty) {
           final cats = pages.values.first['categories'] as List<dynamic>?;
@@ -322,19 +318,19 @@ class _MainScreenState extends State<MainScreen> {
                   name.contains('識別子') ||
                   name.contains('合意') ||
                   name.contains('案内') ||
+                  name.contains('一覧') ||
                   RegExp(r'\d+年').hasMatch(name)) {
                 continue;
               }
-              abstractNodes.add(name);
-              if (abstractNodes.length >= 6) break; // 上位概念を最大6件
+              rawAbstractCandidates.add(name);
             }
           }
         }
       }
 
-      // 具体ノード抽出（本文内リンク・日付完全排除）
-      if (responses[1].statusCode == 200) {
-        final data = json.decode(responses[1].body);
+      // 2. 下位候補（本文リンクから日付・管理タグを除外）
+      if (resList[1].statusCode == 200) {
+        final data = json.decode(resList[1].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
         if (pages != null && pages.isNotEmpty) {
           final links = pages.values.first['links'] as List<dynamic>?;
@@ -343,27 +339,68 @@ class _MainScreenState extends State<MainScreen> {
               final t = l['title'].toString();
               if (t.contains(':') || t.endsWith('の一覧') || t.contains('(曖昧さ回避)')) continue;
 
-              // 日付・年号・時代区分を徹底ブロック
-              final isDateOrYear = RegExp(r'^\d+年$').hasMatch(t) ||
+              final isDate = RegExp(r'^\d+年$').hasMatch(t) ||
                   RegExp(r'^\d+月(\d+日)?$').hasMatch(t) ||
                   RegExp(r'^(明治|大正|昭和|平成|令和)\d+年?$').hasMatch(t) ||
                   RegExp(r'紀元前\d+年?').hasMatch(t) ||
                   RegExp(r'^\d+年代$').hasMatch(t) ||
                   RegExp(r'^\d+世紀$').hasMatch(t);
 
-              if (isDateOrYear) continue;
-
-              concreteNodes.add(t);
-              if (concreteNodes.length >= 14) break; // 具体概念を最大14件
+              if (isDate) continue;
+              rawConcreteCandidates.add(t);
             }
           }
         }
       }
 
-      // 抽象（大枠）と具体（詳細）をマージ
-      final merged = [...abstractNodes, ...concreteNodes];
+      // 3. 実在確認（API一括検証：赤リンクを100%排除）
+      final allCandidates = [
+        ...rawAbstractCandidates.take(12),
+        ...rawConcreteCandidates.take(30),
+      ];
+
+      if (allCandidates.isEmpty) return;
+
+      final verifyUrl = Uri.parse(
+        'https://ja.wikipedia.org/w/api.php?action=query&titles=${Uri.encodeComponent(allCandidates.join('|'))}&format=json'
+      );
+      final verifyRes = await http.get(verifyUrl, headers: _apiHeaders);
+
+      final Set<String> validArticles = {};
+      if (verifyRes.statusCode == 200) {
+        final vData = json.decode(verifyRes.body);
+        final vPages = vData['query']?['pages'] as Map<String, dynamic>?;
+        if (vPages != null) {
+          for (final page in vPages.values) {
+            // missing（存在しない記事）が付いていないものだけを許可
+            if (page['missing'] == null && page['title'] != null) {
+              validArticles.add(page['title'].toString());
+            }
+          }
+        }
+      }
+
+      // 4. 実在する記事のみで抽象・具体ノードを構築
+      final List<ConstellationItem> finalized = [];
+
+      // 上位概念（抽象：紫）最大6件
+      for (final ab in rawAbstractCandidates) {
+        if (validArticles.contains(ab) && finalized.where((e) => e.isAbstract).length < 6) {
+          finalized.add(ConstellationItem(title: ab, isAbstract: true));
+        }
+      }
+
+      // 下位概念（具体：水色）最大14件
+      for (final con in rawConcreteCandidates) {
+        if (validArticles.contains(con) &&
+            !finalized.any((e) => e.title == con) &&
+            finalized.where((e) => !e.isAbstract).length < 14) {
+          finalized.add(ConstellationItem(title: con, isAbstract: false));
+        }
+      }
+
       setState(() {
-        _starLinks = merged;
+        _starNodes = finalized;
       });
     } catch (_) {}
   }
@@ -397,7 +434,7 @@ class _MainScreenState extends State<MainScreen> {
       backgroundColor: Colors.transparent,
       builder: (ctx) => ConstellationModal(
         centerTitle: _currentTitle,
-        links: _starLinks,
+        items: _starNodes,
         onSelectNode: (selected) {
           Navigator.pop(ctx);
           _loadArticle(selected);
@@ -492,8 +529,15 @@ class _MainScreenState extends State<MainScreen> {
 }
 
 // ----------------------------------------------------
-// 星座マップ（具体・抽象 2層ハイブリッド表現）
+// 星座データモデル & UI
 // ----------------------------------------------------
+class ConstellationItem {
+  final String title;
+  final bool isAbstract;
+
+  ConstellationItem({required this.title, required this.isAbstract});
+}
+
 class StarNode {
   final String title;
   final Offset position;
@@ -512,13 +556,13 @@ class StarNode {
 
 class ConstellationModal extends StatefulWidget {
   final String centerTitle;
-  final List<String> links;
+  final List<ConstellationItem> items;
   final Function(String) onSelectNode;
 
   const ConstellationModal({
     super.key,
     required this.centerTitle,
-    required this.links,
+    required this.items,
     required this.onSelectNode,
   });
 
@@ -544,27 +588,28 @@ class _ConstellationModalState extends State<ConstellationModal> {
       isCenter: true,
     ));
 
-    if (widget.links.isEmpty) return;
+    if (widget.items.isEmpty) return;
 
     final minDim = math.min(size.width, size.height);
-    final count = widget.links.length;
+    final count = widget.items.length;
 
     for (int i = 0; i < count; i++) {
-      final isCat = i < 6; // 前半6個は上位カテゴリ（抽象）
-      final baseDist = minDim * (isCat ? (isTablet ? 0.44 : 0.42) : (isTablet ? 0.32 : 0.30));
+      final item = widget.items[i];
+      // 上位概念（抽象）は外周の軌道、具体は内側の軌道に配置
+      final baseDist = minDim * (item.isAbstract ? (isTablet ? 0.44 : 0.42) : (isTablet ? 0.32 : 0.30));
       final rad = (i / count) * math.pi * 2;
-      final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.04);
+      final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.035);
       final dist = baseDist + offset;
 
       final x = cx + math.cos(rad) * dist;
       final y = cy + math.sin(rad) * dist;
 
       _nodes.add(StarNode(
-        title: widget.links[i],
+        title: item.title,
         position: Offset(x, y),
-        radius: isCat ? (isTablet ? 9.0 : 7.0) : (isTablet ? 7.0 : 5.5),
+        radius: item.isAbstract ? (isTablet ? 9.0 : 7.5) : (isTablet ? 7.0 : 5.5),
         isCenter: false,
-        isAbstract: isCat,
+        isAbstract: item.isAbstract,
       ));
     }
   }
@@ -614,7 +659,7 @@ class _ConstellationModalState extends State<ConstellationModal> {
                     ),
                     const SizedBox(width: 8),
                     const Text(
-                      '紫: 上位概念 / 水色: 関連詳細',
+                      '紫: 上位・背景 / 水色: 関連詳細',
                       style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
                     ),
                   ],
@@ -661,7 +706,7 @@ class ConstellationPainter extends CustomPainter {
     final center = nodes.first;
 
     final linePaint = Paint()
-      ..color = const Color(0xFF38BDF8).withValues(alpha: 0.22)
+      ..color = const Color(0xFF38BDF8).withValues(alpha: 0.20)
       ..strokeWidth = 1.0;
 
     final centerStarPaint = Paint()..color = const Color(0xFF38BDF8);
@@ -685,7 +730,6 @@ class ConstellationPainter extends CustomPainter {
         canvas.drawCircle(node.position, node.radius + 6, haloPaint);
         canvas.drawCircle(node.position, node.radius, centerStarPaint);
       } else {
-        // 抽象（上位概念）は淡い紫色、具体（詳細）は澄んだ水色で描き分け
         final starColor = node.isAbstract ? const Color(0xFFC084FC) : const Color(0xFFE0F2FE);
         final glowColor = node.isAbstract ? const Color(0xFFA855F7).withValues(alpha: 0.25) : Colors.white.withValues(alpha: 0.08);
 
