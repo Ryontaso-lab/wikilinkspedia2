@@ -76,7 +76,7 @@ class _MainScreenState extends State<MainScreen> {
   int _currentHistoryIdx = -1;
   List<ConstellationItem> _starNodes = [];
   int _targetRestoreScrollY = 0;
-  int _latestReportedScrollY = 0;
+  int _currentScrollY = 0;
 
   StreamSubscription? _intentSub;
 
@@ -166,7 +166,7 @@ class _MainScreenState extends State<MainScreen> {
         onMessageReceived: (JavaScriptMessage msg) {
           final val = int.tryParse(msg.message);
           if (val != null) {
-            _latestReportedScrollY = val;
+            _currentScrollY = val;
             if (_currentHistoryIdx >= 0 && _currentHistoryIdx < _history.length) {
               _history[_currentHistoryIdx].scrollY = val;
             }
@@ -190,30 +190,39 @@ class _MainScreenState extends State<MainScreen> {
           onPageFinished: (String url) {
             _applyThemeToWebView();
 
+            // スクロール追跡用リスナー
             _webCtrl.runJavaScript('''
-              window.removeEventListener('scroll', window._flutterScrollDebounce);
-              window._flutterScrollDebounce = function() {
+              window.removeEventListener('scroll', window._flutterScrollTracker);
+              window._flutterScrollTracker = function() {
                 if (window.ScrollTracker) {
                   window.ScrollTracker.postMessage(Math.round(window.scrollY || window.pageYOffset || 0).toString());
                 }
               };
-              window.addEventListener('scroll', window._flutterScrollDebounce, { passive: true });
+              window.addEventListener('scroll', window._flutterScrollTracker, { passive: true });
             ''');
 
+            // 確実なスクロール位置復元（HTML高さが確保されるまでポーリング監視）
             if (_targetRestoreScrollY > 0) {
               final targetY = _targetRestoreScrollY;
               _targetRestoreScrollY = 0;
               _webCtrl.runJavaScript('''
                 (function() {
                   var target = $targetY;
-                  var tries = 0;
-                  var interval = setInterval(function() {
-                    window.scrollTo(0, target);
-                    tries++;
-                    if (Math.abs((window.scrollY || window.pageYOffset || 0) - target) < 15 || tries > 10) {
-                      clearInterval(interval);
+                  var attempts = 0;
+                  var checker = setInterval(function() {
+                    attempts++;
+                    var docHeight = Math.max(
+                      document.body.scrollHeight || 0,
+                      document.documentElement.scrollHeight || 0
+                    );
+                    // ページの高さが目標値に届いているか、または最大2.5秒試行
+                    if (docHeight >= target || attempts >= 25) {
+                      window.scrollTo(0, target);
+                      if (Math.abs((window.scrollY || window.pageYOffset || 0) - target) < 20 || attempts >= 25) {
+                        clearInterval(checker);
+                      }
                     }
-                  }, 80);
+                  }, 100);
                 })();
               ''');
             }
@@ -260,14 +269,15 @@ class _MainScreenState extends State<MainScreen> {
   Future<void> _loadArticle(String title, {bool addHistory = true, int restoreScrollY = 0}) async {
     if (title.isEmpty) return;
 
+    // 現在の記事の最新スクロール位置を履歴に確定保存
     if (_currentHistoryIdx >= 0 && _currentHistoryIdx < _history.length) {
-      _history[_currentHistoryIdx].scrollY = _latestReportedScrollY;
+      _history[_currentHistoryIdx].scrollY = _currentScrollY;
     }
 
     setState(() {
       _currentTitle = title;
       _targetRestoreScrollY = restoreScrollY;
-      _latestReportedScrollY = restoreScrollY;
+      _currentScrollY = restoreScrollY;
     });
 
     final rawTitle = title.replaceAll(' ', '_');
@@ -285,7 +295,6 @@ class _MainScreenState extends State<MainScreen> {
     _fetchVerifiedConstellation(title);
   }
 
-  // 実在確認付きの上位概念（抽象）と下位概念（具体）の精製取得
   Future<void> _fetchVerifiedConstellation(String title) async {
     try {
       final catUrl = Uri.parse(
@@ -303,7 +312,6 @@ class _MainScreenState extends State<MainScreen> {
       final List<String> rawAbstractCandidates = [];
       final List<String> rawConcreteCandidates = [];
 
-      // 1. 上位候補（カテゴリから管理タグを除いた名詞）
       if (resList[0].statusCode == 200) {
         final data = json.decode(resList[0].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -328,7 +336,6 @@ class _MainScreenState extends State<MainScreen> {
         }
       }
 
-      // 2. 下位候補（本文リンクから日付・管理タグを除外）
       if (resList[1].statusCode == 200) {
         final data = json.decode(resList[1].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -353,7 +360,6 @@ class _MainScreenState extends State<MainScreen> {
         }
       }
 
-      // 3. 実在確認（API一括検証：赤リンクを100%排除）
       final allCandidates = [
         ...rawAbstractCandidates.take(12),
         ...rawConcreteCandidates.take(30),
@@ -372,7 +378,6 @@ class _MainScreenState extends State<MainScreen> {
         final vPages = vData['query']?['pages'] as Map<String, dynamic>?;
         if (vPages != null) {
           for (final page in vPages.values) {
-            // missing（存在しない記事）が付いていないものだけを許可
             if (page['missing'] == null && page['title'] != null) {
               validArticles.add(page['title'].toString());
             }
@@ -380,17 +385,14 @@ class _MainScreenState extends State<MainScreen> {
         }
       }
 
-      // 4. 実在する記事のみで抽象・具体ノードを構築
       final List<ConstellationItem> finalized = [];
 
-      // 上位概念（抽象：紫）最大6件
       for (final ab in rawAbstractCandidates) {
         if (validArticles.contains(ab) && finalized.where((e) => e.isAbstract).length < 6) {
           finalized.add(ConstellationItem(title: ab, isAbstract: true));
         }
       }
 
-      // 下位概念（具体：水色）最大14件
       for (final con in rawConcreteCandidates) {
         if (validArticles.contains(con) &&
             !finalized.any((e) => e.title == con) &&
@@ -595,7 +597,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
 
     for (int i = 0; i < count; i++) {
       final item = widget.items[i];
-      // 上位概念（抽象）は外周の軌道、具体は内側の軌道に配置
       final baseDist = minDim * (item.isAbstract ? (isTablet ? 0.44 : 0.42) : (isTablet ? 0.32 : 0.30));
       final rad = (i / count) * math.pi * 2;
       final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.035);
