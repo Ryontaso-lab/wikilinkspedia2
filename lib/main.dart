@@ -3,10 +3,11 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'package:flutter_html/flutter_html.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const WikiApp());
 }
 
@@ -36,13 +37,11 @@ class _WikiAppState extends State<WikiApp> {
         brightness: Brightness.light,
         scaffoldBackgroundColor: const Color(0xFFF8FAFC),
         primaryColor: const Color(0xFF0284C7),
-        cardColor: Colors.white,
       ),
       darkTheme: ThemeData(
         brightness: Brightness.dark,
         scaffoldBackgroundColor: const Color(0xFF0B0F19),
         primaryColor: const Color(0xFF38BDF8),
-        cardColor: const Color(0xFF1E293B),
       ),
       home: MainScreen(onToggleTheme: toggleTheme),
     );
@@ -59,12 +58,9 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> {
   final TextEditingController _searchCtrl = TextEditingController();
-  final ScrollController _scrollCtrl = ScrollController();
-  
-  String _currentTitle = '読み込み中...';
-  String _articleHtml = '<p>扉を開いています...</p>';
-  bool _isLoading = false;
+  late final WebViewController _webCtrl;
 
+  String _currentTitle = '読み込み中...';
   final List<String> _history = [];
   int _currentHistoryIdx = -1;
   List<String> _starLinks = [];
@@ -75,15 +71,36 @@ class _MainScreenState extends State<MainScreen> {
   void initState() {
     super.initState();
 
-    // 1. 共有メニューからテキストを受け取る（アプリ常駐時）
-    _intentSub = ReceiveSharingIntent.instance.getTextStream().listen((String value) {
-      _handleSharedText(value);
-    }, onError: (err) {});
+    _webCtrl = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onNavigationRequest: (NavigationRequest req) {
+            final url = req.url;
+            if (url.contains('wikipedia.org/wiki/')) {
+              final raw = url.split('/wiki/').last.split('#').first.split('?').first;
+              final clean = Uri.decodeComponent(raw).replaceAll('_', ' ');
+              if (clean != _currentTitle) {
+                _loadArticle(clean);
+                return NavigationDecision.prevent;
+              }
+            }
+            return NavigationDecision.navigate;
+          },
+        ),
+      );
 
-    // 2. 共有メニューから起動された時（初回起動時）
-    ReceiveSharingIntent.instance.getInitialText().then((String? value) {
-      if (value != null && value.isNotEmpty) {
-        _handleSharedText(value);
+    // 共有受け取りの待機（常駐時）
+    _intentSub = ReceiveSharingIntent.instance.getMediaStream().listen((List<SharedMediaFile> value) {
+      if (value.isNotEmpty) {
+        _handleSharedPayload(value.first.path);
+      }
+    }, onError: (_) {});
+
+    // 共有受け取り（コールドスタート時）
+    ReceiveSharingIntent.instance.getInitialMedia().then((List<SharedMediaFile> value) {
+      if (value.isNotEmpty) {
+        _handleSharedPayload(value.first.path);
       } else {
         _fetchRandomArticle();
       }
@@ -94,18 +111,16 @@ class _MainScreenState extends State<MainScreen> {
   void dispose() {
     _intentSub?.cancel();
     _searchCtrl.dispose();
-    _scrollCtrl.dispose();
     super.dispose();
   }
 
-  // 共有テキストから記事タイトルを抽出して開く
-  void _handleSharedText(String text) {
+  void _handleSharedPayload(String payload) {
     String title = '';
-    final match = RegExp(r'wikipedia\.org/wiki/([^?#\s]+)').firstMatch(text);
+    final match = RegExp(r'wikipedia\.org/wiki/([^?#\s]+)').firstMatch(payload);
     if (match != null && match.group(1) != null) {
       title = Uri.decodeComponent(match.group(1)!).replaceAll('_', ' ');
     } else {
-      title = text.replaceAll(RegExp(r' - Wikipedia.*$'), '').trim();
+      title = payload.replaceAll(RegExp(r' - Wikipedia.*$'), '').trim();
     }
 
     if (title.isNotEmpty) {
@@ -113,64 +128,51 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
-  // Wikipedia REST APIから記事取得
   Future<void> _loadArticle(String title, {bool addHistory = true}) async {
     if (title.isEmpty) return;
 
     setState(() {
-      _isLoading = true;
       _currentTitle = title;
-      _articleHtml = '<p style="color:gray;">記事を取得しています...</p>';
     });
 
     final rawTitle = title.replaceAll(' ', '_');
-    final url = Uri.parse('https://ja.wikipedia.org/api/rest_v1/page/html/${Uri.encodeComponent(rawTitle)}');
+    final directUrl = 'https://ja.m.wikipedia.org/wiki/${Uri.encodeComponent(rawTitle)}';
 
-    try {
-      final res = await http.get(url);
-      if (res.statusCode == 200) {
-        final html = res.body;
+    _webCtrl.loadRequest(Uri.parse(directUrl));
 
-        if (addHistory) {
-          _history.add(title);
-          _currentHistoryIdx = _history.length - 1;
-        }
-
-        _extractStarLinks(html);
-
-        setState(() {
-          _articleHtml = html;
-          _isLoading = false;
-        });
-
-        // ページ上部へスクロール
-        if (_scrollCtrl.hasClients) {
-          _scrollCtrl.jumpTo(0);
-        }
-      } else {
-        throw Exception();
-      }
-    } catch (e) {
+    if (addHistory) {
       setState(() {
-        _isLoading = false;
-        _articleHtml = '<p style="color:red; font-weight:bold;">記事の取得に失敗しました</p>';
+        _history.add(title);
+        _currentHistoryIdx = _history.length - 1;
       });
     }
+
+    _fetchStarLinksFromApi(title);
   }
 
-  // 記事内の内部リンクを星座用リストとして抽出
-  void _extractStarLinks(String html) {
-    final matches = RegExp(r'href="\./([^"#?:]+)"').allMatches(html);
-    final Set<String> titles = {};
-    for (var m in matches) {
-      if (m.group(1) != null) {
-        titles.add(Uri.decodeComponent(m.group(1)!).replaceAll('_', ' '));
+  // 星座用に内部リンクをAPIから取得
+  Future<void> _fetchStarLinksFromApi(String title) async {
+    try {
+      final apiUrl = Uri.parse(
+        'https://ja.wikipedia.org/w/api.php?action=query&prop=links&pllimit=20&format=json&titles=${Uri.encodeComponent(title)}'
+      );
+      final res = await http.get(apiUrl);
+      if (res.statusCode == 200) {
+        final data = json.decode(res.body);
+        final pages = data['query']?['pages'] as Map<String, dynamic>?;
+        if (pages != null && pages.isNotEmpty) {
+          final firstPage = pages.values.first;
+          final linksList = firstPage['links'] as List<dynamic>?;
+          if (linksList != null) {
+            setState(() {
+              _starLinks = linksList.map((e) => e['title'].toString()).toList();
+            });
+          }
+        }
       }
-    }
-    _starLinks = titles.take(20).toList();
+    } catch (_) {}
   }
 
-  // ランダム記事取得
   Future<void> _fetchRandomArticle() async {
     try {
       final res = await http.get(Uri.parse('https://ja.wikipedia.org/api/rest_v1/page/random/title'));
@@ -184,7 +186,6 @@ class _MainScreenState extends State<MainScreen> {
     _loadArticle('富士山');
   }
 
-  // 星座モーダル表示
   void _openConstellation() {
     showModalBottomSheet(
       context: context,
@@ -207,11 +208,10 @@ class _MainScreenState extends State<MainScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        titleSpacing: 8,
         title: TextField(
           controller: _searchCtrl,
           decoration: InputDecoration(
-            hintText: 'キーワード (例: 日本, 富士山)',
+            hintText: '検索 (例: 富士山, 太陽系)',
             isDense: true,
             contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
@@ -247,7 +247,6 @@ class _MainScreenState extends State<MainScreen> {
       ),
       body: Row(
         children: [
-          // タブレット用：左サイドバー（探索ログ）
           if (isTablet)
             Container(
               width: 260,
@@ -275,45 +274,8 @@ class _MainScreenState extends State<MainScreen> {
                 },
               ),
             ),
-
-          // 右メインコンテンツ
           Expanded(
-            child: SingleChildScrollView(
-              controller: _scrollCtrl,
-              padding: const EdgeInsets.all(20),
-              child: Center(
-                child: Container(
-                  constraints: const BoxConstraints(maxWidth: 960),
-                  padding: const EdgeInsets.all(24),
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).cardColor,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        _currentTitle,
-                        style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
-                      ),
-                      const Divider(height: 32),
-                      Html(
-                        data: _articleHtml,
-                        onLinkTap: (url, _, __) {
-                          if (url != null) {
-                            if (url.startsWith('./') || url.contains('/wiki/')) {
-                              final raw = url.split('/wiki/').last.replaceAll('./', '');
-                              final clean = Uri.decodeComponent(raw.split('#').first);
-                              _loadArticle(clean);
-                            }
-                          }
-                        },
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
+            child: WebViewWidget(controller: _webCtrl),
           ),
         ],
       ),
@@ -321,9 +283,7 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
-// ----------------------------------------------------
 // 静止型星座マップモーダル
-// ----------------------------------------------------
 class ConstellationModal extends StatelessWidget {
   final String centerTitle;
   final List<String> links;
@@ -368,7 +328,6 @@ class ConstellationModal extends StatelessWidget {
               painter: ConstellationPainter(centerTitle: centerTitle, links: links),
             ),
           ),
-          // 下部に星一覧ボタンを配置（タップ確実化）
           SizedBox(
             height: 70,
             child: ListView.builder(
@@ -412,7 +371,6 @@ class ConstellationPainter extends CustomPainter {
     final starPaint = Paint()..color = const Color(0xFFE0F2FE);
     final centerStarPaint = Paint()..color = const Color(0xFF38BDF8);
 
-    // 中心星
     canvas.drawCircle(centerOffset, 16, centerStarPaint);
 
     if (links.isEmpty) return;
@@ -421,15 +379,12 @@ class ConstellationPainter extends CustomPainter {
     final count = links.length;
 
     for (int i = 0; i < count; i++) {
-      final rad = (i / count) * math.PI * 2;
+      final rad = (i / count) * math.pi * 2;
       final x = cx + math.cos(rad) * radius;
       final y = cy + math.sin(rad) * radius;
       final nodeOffset = Offset(x, y);
 
-      // 中心からの連結線
       canvas.drawLine(centerOffset, nodeOffset, linePaint);
-
-      // 周囲の星
       canvas.drawCircle(nodeOffset, 6, starPaint);
     }
   }
