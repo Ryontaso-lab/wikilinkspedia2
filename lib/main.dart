@@ -90,12 +90,14 @@ class _MainScreenState extends State<MainScreen> {
         ),
       );
 
+    // 共有 ＆ リンク直接タップ受け取り（アプリ常駐時）
     _intentSub = ReceiveSharingIntent.instance.getMediaStream().listen((List<SharedMediaFile> value) {
       if (value.isNotEmpty) {
         _handleSharedPayload(value.first.path);
       }
     }, onError: (_) {});
 
+    // 共有 ＆ リンク直接タップ起動（初回起動時）
     ReceiveSharingIntent.instance.getInitialMedia().then((List<SharedMediaFile> value) {
       if (value.isNotEmpty) {
         _handleSharedPayload(value.first.path);
@@ -112,6 +114,7 @@ class _MainScreenState extends State<MainScreen> {
     super.dispose();
   }
 
+  // 渡された文字列（URLまたは共有テキスト）から記事名を抽出
   void _handleSharedPayload(String payload) {
     String title = '';
     final match = RegExp(r'wikipedia\.org/wiki/([^?#\s]+)').firstMatch(payload);
@@ -281,7 +284,7 @@ class _MainScreenState extends State<MainScreen> {
 }
 
 // ----------------------------------------------------
-// 静止型星座マップモーダル（星・ラベル直タップ対応）
+// 星座マップ（星・直下ラベル直タップ対応）
 // ----------------------------------------------------
 class StarNode {
   final String title;
@@ -325,7 +328,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
     final centerR = isTablet ? 18.0 : 15.0;
     final starR = isTablet ? 8.0 : 6.0;
 
-    // 中心星
     _nodes.add(StarNode(
       title: widget.centerTitle,
       position: Offset(cx, cy),
@@ -340,7 +342,7 @@ class _ConstellationModalState extends State<ConstellationModal> {
     final count = widget.links.length;
 
     for (int i = 0; i < count; i++) {
-      final rad = (i / count) * math.PI * 2;
+      final rad = (i / count) * math.pi * 2;
       final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.05);
       final dist = baseDist + offset;
 
@@ -356,19 +358,18 @@ class _ConstellationModalState extends State<ConstellationModal> {
     }
   }
 
-  // タップ判定（星の円 + 下部ラベル領域を判定）
   void _handleTap(Offset tapPos) {
     for (final node in _nodes) {
       if (node.isCenter) continue;
 
-      // 星の中心からの距離判定（タップしやすさのため当たり判定を半径+24pxに拡大）
+      // 星本体の周囲判定（半径+24px）
       final dist = (node.position - tapPos).distance;
       if (dist <= node.radius + 24.0) {
         widget.onSelectNode(node.title);
         return;
       }
 
-      // 星の直下のテキスト領域判定
+      // 直下ラベル領域の矩形判定
       final textRect = Rect.fromCenter(
         center: Offset(node.position.dx, node.position.dy + node.radius + 14.0),
         width: 100.0,
@@ -460,7 +461,6 @@ class ConstellationPainter extends CustomPainter {
       ..color = const Color(0xFF38BDF8).withValues(alpha: 0.20)
       ..style = PaintingStyle.fill;
 
-    // 1. 接続線の描画
     for (int i = 1; i < nodes.length; i++) {
       final node = nodes[i];
       canvas.drawLine(center.position, node.position, linePaint);
@@ -472,7 +472,6 @@ class ConstellationPainter extends CustomPainter {
       canvas.drawLine(node.position, next.position, perimeterPaint);
     }
 
-    // 2. 星と直下ラベルの描画
     for (final node in nodes) {
       if (node.isCenter) {
         canvas.drawCircle(node.position, node.radius + 6, haloPaint);
@@ -486,7 +485,6 @@ class ConstellationPainter extends CustomPainter {
         canvas.drawCircle(node.position, node.radius, starPaint);
       }
 
-      // 直下のテキストラベル描画
       final displayLabel = node.title.length > 9 ? '${node.title.substring(0, 8)}…' : node.title;
 
       final textSpan = TextSpan(
