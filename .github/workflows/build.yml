@@ -22,13 +22,35 @@ jobs:
         with:
           channel: 'stable'
 
-      # 古い/不完全なandroidフォルダを一旦リセットして完全な最新土台を生成
       - name: Recreate Clean Android Scaffold
         run: |
           rm -rf android
           flutter create --platforms=android --org com.ryontaso.wikilinks .
           
-          # 生成された AndroidManifest.xml に共有受け取りアンテナを自動注入
+          # 1. Android SDK のバージョンをプラグイン要求の 37 に引き上げる
+          python3 -c "
+          import re
+          path = 'android/app/build.gradle.kts'
+          try:
+              with open(path, 'r') as f:
+                  txt = f.read()
+              # compileSdk / targetSdk を 37 に置換
+              txt = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 37', txt)
+              txt = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 37', txt)
+              with open(path, 'w') as f:
+                  f.write(txt)
+          except Exception:
+              # build.gradle (Groovy) 形式の場合のフォールバック
+              path_groovy = 'android/app/build.gradle'
+              with open(path_groovy, 'r') as f:
+                  txt = f.read()
+              txt = re.sub(r'compileSdkVersion\s+\d+', 'compileSdkVersion 37', txt)
+              txt = re.sub(r'targetSdkVersion\s+\d+', 'targetSdkVersion 37', txt)
+              with open(path_groovy, 'w') as f:
+                  f.write(txt)
+          "
+
+          # 2. AndroidManifest.xml に共有受け取りアンテナを自動注入
           python3 -c "
           path = 'android/app/src/main/AndroidManifest.xml'
           with open(path, 'r') as f:
