@@ -51,7 +51,6 @@ class _WikiAppState extends State<WikiApp> {
   }
 }
 
-// 探索ログ管理用クラス（記事名とスクロール位置をセットで保持）
 class HistoryItem {
   final String title;
   int scrollY;
@@ -76,7 +75,8 @@ class _MainScreenState extends State<MainScreen> {
   final List<HistoryItem> _history = [];
   int _currentHistoryIdx = -1;
   List<String> _starLinks = [];
-  int _targetRestoreScrollY = 0; // 復元用スクロール目標値
+  int _targetRestoreScrollY = 0;
+  int _latestReportedScrollY = 0;
 
   StreamSubscription? _intentSub;
 
@@ -161,6 +161,18 @@ class _MainScreenState extends State<MainScreen> {
     _webCtrl = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(const Color(0xFF0B0F19))
+      ..addJavaScriptChannel(
+        'ScrollTracker',
+        onMessageReceived: (JavaScriptMessage msg) {
+          final val = int.tryParse(msg.message);
+          if (val != null) {
+            _latestReportedScrollY = val;
+            if (_currentHistoryIdx >= 0 && _currentHistoryIdx < _history.length) {
+              _history[_currentHistoryIdx].scrollY = val;
+            }
+          }
+        },
+      )
       ..setNavigationDelegate(
         NavigationDelegate(
           onNavigationRequest: (NavigationRequest req) {
@@ -178,14 +190,34 @@ class _MainScreenState extends State<MainScreen> {
           onPageFinished: (String url) {
             _applyThemeToWebView();
 
-            // 復元先のスクロール位置が指定されていればスクロール
+            // スクロール追跡用リスナー注入
+            _webCtrl.runJavaScript('''
+              window.removeEventListener('scroll', window._flutterScrollDebounce);
+              window._flutterScrollDebounce = function() {
+                if (window.ScrollTracker) {
+                  window.ScrollTracker.postMessage(Math.round(window.scrollY || window.pageYOffset || 0).toString());
+                }
+              };
+              window.addEventListener('scroll', window._flutterScrollDebounce, { passive: true });
+            ''');
+
+            // スクロール位置の段階的確実復元（DOM構築完了までリトライ）
             if (_targetRestoreScrollY > 0) {
-              final y = _targetRestoreScrollY;
+              final targetY = _targetRestoreScrollY;
               _targetRestoreScrollY = 0;
-              // 描画安定を待ってからスクロール
-              Future.delayed(const Duration(milliseconds: 150), () {
-                _webCtrl.runJavaScript('window.scrollTo({top: $y, behavior: "smooth"});');
-              });
+              _webCtrl.runJavaScript('''
+                (function() {
+                  var target = $targetY;
+                  var tries = 0;
+                  var interval = setInterval(function() {
+                    window.scrollTo(0, target);
+                    tries++;
+                    if (Math.abs((window.scrollY || window.pageYOffset || 0) - target) < 15 || tries > 10) {
+                      clearInterval(interval);
+                    }
+                  }, 80);
+                })();
+              ''');
             }
           },
         ),
@@ -227,21 +259,17 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
-  // 現在の閲覧位置を退避してから記事を切り替える
   Future<void> _loadArticle(String title, {bool addHistory = true, int restoreScrollY = 0}) async {
     if (title.isEmpty) return;
 
-    // 現在閲覧中の記事があればスクロール位置を取得して履歴に保存
     if (_currentHistoryIdx >= 0 && _currentHistoryIdx < _history.length) {
-      try {
-        final currentScrollOffset = await _webCtrl.getScrollPosition();
-        _history[_currentHistoryIdx].scrollY = currentScrollOffset.dy.toInt();
-      } catch (_) {}
+      _history[_currentHistoryIdx].scrollY = _latestReportedScrollY;
     }
 
     setState(() {
       _currentTitle = title;
       _targetRestoreScrollY = restoreScrollY;
+      _latestReportedScrollY = restoreScrollY;
     });
 
     final rawTitle = title.replaceAll(' ', '_');
@@ -256,54 +284,87 @@ class _MainScreenState extends State<MainScreen> {
       });
     }
 
-    _fetchStarLinksFromApi(title);
+    _fetchConstellationLinks(title);
   }
 
-  Future<void> _fetchStarLinksFromApi(String title) async {
+  // 「具体（本文リンク）」と「抽象（大カテゴリー）」を融合して取得
+  Future<void> _fetchConstellationLinks(String title) async {
     try {
-      final apiUrl = Uri.parse(
+      // 1. カテゴリ（抽象・大きな枠組み）を取得
+      final catUrl = Uri.parse(
+        'https://ja.wikipedia.org/w/api.php?action=query&prop=categories&cllimit=30&format=json&titles=${Uri.encodeComponent(title)}'
+      );
+      // 2. 本文リンク（具体・下位トピック）を取得
+      final linkUrl = Uri.parse(
         'https://ja.wikipedia.org/w/api.php?action=query&prop=links&plnamespace=0&pllimit=150&format=json&titles=${Uri.encodeComponent(title)}'
       );
-      final res = await http.get(apiUrl, headers: _apiHeaders);
-      if (res.statusCode == 200) {
-        final data = json.decode(res.body);
+
+      final responses = await Future.wait([
+        http.get(catUrl, headers: _apiHeaders),
+        http.get(linkUrl, headers: _apiHeaders),
+      ]);
+
+      final List<String> abstractNodes = [];
+      final List<String> concreteNodes = [];
+
+      // 抽象ノード抽出（カテゴリの整理）
+      if (responses[0].statusCode == 200) {
+        final data = json.decode(responses[0].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
         if (pages != null && pages.isNotEmpty) {
-          final firstPage = pages.values.first;
-          final linksList = firstPage['links'] as List<dynamic>?;
-          if (linksList != null) {
-            int dateCount = 0;
-            final List<String> result = [];
-
-            for (final item in linksList) {
-              final t = item['title'].toString();
-              if (t.contains(':') || t.endsWith('の一覧') || t.contains('(曖昧さ回避)')) {
+          final cats = pages.values.first['categories'] as List<dynamic>?;
+          if (cats != null) {
+            for (final c in cats) {
+              String name = c['title'].toString().replaceFirst('Category:', '').trim();
+              if (name.contains('ウィキプロジェクト') ||
+                  name.contains('スタブ') ||
+                  name.contains('追跡') ||
+                  name.contains('識別子') ||
+                  name.contains('合意') ||
+                  name.contains('案内') ||
+                  RegExp(r'\d+年').hasMatch(name)) {
                 continue;
               }
-
-              final isPureDate = RegExp(r'^\d+年$').hasMatch(t) ||
-                  RegExp(r'^\d+月\d+日$').hasMatch(t) ||
-                  RegExp(r'^(明治|大正|昭和|平成|令和)\d+年?$').hasMatch(t) ||
-                  RegExp(r'紀元前\d+年?').hasMatch(t);
-
-              if (isPureDate) {
-                if (dateCount < 3) {
-                  result.add(t);
-                  dateCount++;
-                }
-              } else {
-                result.add(t);
-              }
-
-              if (result.length >= 20) break;
+              abstractNodes.add(name);
+              if (abstractNodes.length >= 6) break; // 上位概念を最大6件
             }
-
-            setState(() {
-              _starLinks = result;
-            });
           }
         }
       }
+
+      // 具体ノード抽出（本文内リンク・日付完全排除）
+      if (responses[1].statusCode == 200) {
+        final data = json.decode(responses[1].body);
+        final pages = data['query']?['pages'] as Map<String, dynamic>?;
+        if (pages != null && pages.isNotEmpty) {
+          final links = pages.values.first['links'] as List<dynamic>?;
+          if (links != null) {
+            for (final l in links) {
+              final t = l['title'].toString();
+              if (t.contains(':') || t.endsWith('の一覧') || t.contains('(曖昧さ回避)')) continue;
+
+              // 日付・年号・時代区分を徹底ブロック
+              final isDateOrYear = RegExp(r'^\d+年$').hasMatch(t) ||
+                  RegExp(r'^\d+月(\d+日)?$').hasMatch(t) ||
+                  RegExp(r'^(明治|大正|昭和|平成|令和)\d+年?$').hasMatch(t) ||
+                  RegExp(r'紀元前\d+年?').hasMatch(t) ||
+                  RegExp(r'^\d+年代$').hasMatch(t) ||
+                  RegExp(r'^\d+世紀$').hasMatch(t);
+
+              if (isDateOrYear) continue;
+
+              concreteNodes.add(t);
+              if (concreteNodes.length >= 14) break; // 具体概念を最大14件
+            }
+          }
+        }
+      }
+
+      // 抽象（大枠）と具体（詳細）をマージ
+      final merged = [...abstractNodes, ...concreteNodes];
+      setState(() {
+        _starLinks = merged;
+      });
     } catch (_) {}
   }
 
@@ -324,7 +385,7 @@ class _MainScreenState extends State<MainScreen> {
       }
     } catch (_) {}
 
-    const fallbacks = ['宇宙', '深海', 'ピラミッド', '量子力学', 'オーロラ', 'アンモナイト', '人工知能'];
+    const fallbacks = ['深海魚', 'ピラミッド', '量子コンピュータ', 'オーロラ', 'アンモナイト', '火星探査'];
     final pick = fallbacks[math.Random().nextInt(fallbacks.length)];
     _loadArticle(pick);
   }
@@ -391,7 +452,6 @@ class _MainScreenState extends State<MainScreen> {
       ),
       body: Row(
         children: [
-          // 左サイドバー（探索ログ）
           if (isTablet)
             Container(
               width: 260,
@@ -416,7 +476,6 @@ class _MainScreenState extends State<MainScreen> {
                       if (_currentHistoryIdx == i) return;
                       final targetScrollY = item.scrollY;
                       _currentHistoryIdx = i;
-                      // 履歴からの復元時は addHistory: false かつ以前の scrollY を渡す
                       _loadArticle(item.title, addHistory: false, restoreScrollY: targetScrollY);
                     },
                   );
@@ -433,19 +492,21 @@ class _MainScreenState extends State<MainScreen> {
 }
 
 // ----------------------------------------------------
-// 星座マップ（星・直下ラベル直タップ対応）
+// 星座マップ（具体・抽象 2層ハイブリッド表現）
 // ----------------------------------------------------
 class StarNode {
   final String title;
   final Offset position;
   final double radius;
   final bool isCenter;
+  final bool isAbstract;
 
   StarNode({
     required this.title,
     required this.position,
     required this.radius,
     required this.isCenter,
+    this.isAbstract = false,
   });
 }
 
@@ -475,7 +536,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
     final isTablet = size.width >= 768;
 
     final centerR = isTablet ? 18.0 : 15.0;
-    final starR = isTablet ? 8.0 : 6.0;
 
     _nodes.add(StarNode(
       title: widget.centerTitle,
@@ -487,12 +547,13 @@ class _ConstellationModalState extends State<ConstellationModal> {
     if (widget.links.isEmpty) return;
 
     final minDim = math.min(size.width, size.height);
-    final baseDist = minDim * (isTablet ? 0.38 : 0.36);
     final count = widget.links.length;
 
     for (int i = 0; i < count; i++) {
+      final isCat = i < 6; // 前半6個は上位カテゴリ（抽象）
+      final baseDist = minDim * (isCat ? (isTablet ? 0.44 : 0.42) : (isTablet ? 0.32 : 0.30));
       final rad = (i / count) * math.pi * 2;
-      final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.05);
+      final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.04);
       final dist = baseDist + offset;
 
       final x = cx + math.cos(rad) * dist;
@@ -501,8 +562,9 @@ class _ConstellationModalState extends State<ConstellationModal> {
       _nodes.add(StarNode(
         title: widget.links[i],
         position: Offset(x, y),
-        radius: starR,
+        radius: isCat ? (isTablet ? 9.0 : 7.0) : (isTablet ? 7.0 : 5.5),
         isCenter: false,
+        isAbstract: isCat,
       ));
     }
   }
@@ -552,8 +614,8 @@ class _ConstellationModalState extends State<ConstellationModal> {
                     ),
                     const SizedBox(width: 8),
                     const Text(
-                      '(星や文字をタップして移動)',
-                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                      '紫: 上位概念 / 水色: 関連詳細',
+                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
                     ),
                   ],
                 ),
@@ -599,10 +661,9 @@ class ConstellationPainter extends CustomPainter {
     final center = nodes.first;
 
     final linePaint = Paint()
-      ..color = const Color(0xFF38BDF8).withValues(alpha: 0.25)
+      ..color = const Color(0xFF38BDF8).withValues(alpha: 0.22)
       ..strokeWidth = 1.0;
 
-    final starPaint = Paint()..color = const Color(0xFFE0F2FE);
     final centerStarPaint = Paint()..color = const Color(0xFF38BDF8);
     final haloPaint = Paint()
       ..color = const Color(0xFF38BDF8).withValues(alpha: 0.20)
@@ -614,7 +675,7 @@ class ConstellationPainter extends CustomPainter {
 
       final next = (i == nodes.length - 1) ? nodes[1] : nodes[i + 1];
       final perimeterPaint = Paint()
-        ..color = const Color(0xFF94A3B8).withValues(alpha: 0.15)
+        ..color = const Color(0xFF94A3B8).withValues(alpha: 0.12)
         ..strokeWidth = 0.8;
       canvas.drawLine(node.position, next.position, perimeterPaint);
     }
@@ -624,12 +685,12 @@ class ConstellationPainter extends CustomPainter {
         canvas.drawCircle(node.position, node.radius + 6, haloPaint);
         canvas.drawCircle(node.position, node.radius, centerStarPaint);
       } else {
-        canvas.drawCircle(
-          node.position,
-          node.radius + 3,
-          Paint()..color = Colors.white.withValues(alpha: 0.08),
-        );
-        canvas.drawCircle(node.position, node.radius, starPaint);
+        // 抽象（上位概念）は淡い紫色、具体（詳細）は澄んだ水色で描き分け
+        final starColor = node.isAbstract ? const Color(0xFFC084FC) : const Color(0xFFE0F2FE);
+        final glowColor = node.isAbstract ? const Color(0xFFA855F7).withValues(alpha: 0.25) : Colors.white.withValues(alpha: 0.08);
+
+        canvas.drawCircle(node.position, node.radius + 3, Paint()..color = glowColor);
+        canvas.drawCircle(node.position, node.radius, Paint()..color = starColor);
       }
 
       final displayLabel = node.title.length > 9 ? '${node.title.substring(0, 8)}…' : node.title;
@@ -637,9 +698,11 @@ class ConstellationPainter extends CustomPainter {
       final textSpan = TextSpan(
         text: displayLabel,
         style: TextStyle(
-          color: node.isCenter ? const Color(0xFF38BDF8) : const Color(0xFFCBD5E1),
-          fontSize: node.isCenter ? 14 : 12,
-          fontWeight: node.isCenter ? FontWeight.bold : FontWeight.normal,
+          color: node.isCenter
+              ? const Color(0xFF38BDF8)
+              : (node.isAbstract ? const Color(0xFFD8B4FE) : const Color(0xFFCBD5E1)),
+          fontSize: node.isCenter ? 14 : 11,
+          fontWeight: (node.isCenter || node.isAbstract) ? FontWeight.bold : FontWeight.normal,
         ),
       );
 
