@@ -90,14 +90,12 @@ class _MainScreenState extends State<MainScreen> {
         ),
       );
 
-    // 共有受け取りの待機（常駐時）
     _intentSub = ReceiveSharingIntent.instance.getMediaStream().listen((List<SharedMediaFile> value) {
       if (value.isNotEmpty) {
         _handleSharedPayload(value.first.path);
       }
     }, onError: (_) {});
 
-    // 共有受け取り（コールドスタート時）
     ReceiveSharingIntent.instance.getInitialMedia().then((List<SharedMediaFile> value) {
       if (value.isNotEmpty) {
         _handleSharedPayload(value.first.path);
@@ -150,7 +148,6 @@ class _MainScreenState extends State<MainScreen> {
     _fetchStarLinksFromApi(title);
   }
 
-  // 星座用に内部リンクをAPIから取得
   Future<void> _fetchStarLinksFromApi(String title) async {
     try {
       final apiUrl = Uri.parse(
@@ -283,8 +280,24 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
-// 静止型星座マップモーダル
-class ConstellationModal extends StatelessWidget {
+// ----------------------------------------------------
+// 静止型星座マップモーダル（星・ラベル直タップ対応）
+// ----------------------------------------------------
+class StarNode {
+  final String title;
+  final Offset position;
+  final double radius;
+  final bool isCenter;
+
+  StarNode({
+    required this.title,
+    required this.position,
+    required this.radius,
+    required this.isCenter,
+  });
+}
+
+class ConstellationModal extends StatefulWidget {
   final String centerTitle;
   final List<String> links;
   final Function(String) onSelectNode;
@@ -297,9 +310,81 @@ class ConstellationModal extends StatelessWidget {
   });
 
   @override
+  State<ConstellationModal> createState() => _ConstellationModalState();
+}
+
+class _ConstellationModalState extends State<ConstellationModal> {
+  List<StarNode> _nodes = [];
+
+  void _calculateNodes(Size size) {
+    _nodes.clear();
+    final cx = size.width / 2;
+    final cy = size.height / 2;
+    final isTablet = size.width >= 768;
+
+    final centerR = isTablet ? 18.0 : 15.0;
+    final starR = isTablet ? 8.0 : 6.0;
+
+    // 中心星
+    _nodes.add(StarNode(
+      title: widget.centerTitle,
+      position: Offset(cx, cy),
+      radius: centerR,
+      isCenter: true,
+    ));
+
+    if (widget.links.isEmpty) return;
+
+    final minDim = math.min(size.width, size.height);
+    final baseDist = minDim * (isTablet ? 0.38 : 0.36);
+    final count = widget.links.length;
+
+    for (int i = 0; i < count; i++) {
+      final rad = (i / count) * math.PI * 2;
+      final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.05);
+      final dist = baseDist + offset;
+
+      final x = cx + math.cos(rad) * dist;
+      final y = cy + math.sin(rad) * dist;
+
+      _nodes.add(StarNode(
+        title: widget.links[i],
+        position: Offset(x, y),
+        radius: starR,
+        isCenter: false,
+      ));
+    }
+  }
+
+  // タップ判定（星の円 + 下部ラベル領域を判定）
+  void _handleTap(Offset tapPos) {
+    for (final node in _nodes) {
+      if (node.isCenter) continue;
+
+      // 星の中心からの距離判定（タップしやすさのため当たり判定を半径+24pxに拡大）
+      final dist = (node.position - tapPos).distance;
+      if (dist <= node.radius + 24.0) {
+        widget.onSelectNode(node.title);
+        return;
+      }
+
+      // 星の直下のテキスト領域判定
+      final textRect = Rect.fromCenter(
+        center: Offset(node.position.dx, node.position.dy + node.radius + 14.0),
+        width: 100.0,
+        height: 28.0,
+      );
+      if (textRect.contains(tapPos)) {
+        widget.onSelectNode(node.title);
+        return;
+      }
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Container(
-      height: MediaQuery.of(context).size.height * 0.85,
+      height: MediaQuery.of(context).size.height * 0.90,
       decoration: const BoxDecoration(
         color: Color(0xFF0B0F19),
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -307,13 +392,22 @@ class ConstellationModal extends StatelessWidget {
       child: Column(
         children: [
           Padding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(
-                  '星座マップ: $centerTitle',
-                  style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                Row(
+                  children: [
+                    Text(
+                      '「${widget.centerTitle}」',
+                      style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(width: 8),
+                    const Text(
+                      '(星や文字をタップして移動)',
+                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                    ),
+                  ],
                 ),
                 IconButton(
                   icon: const Icon(Icons.close, color: Colors.white),
@@ -323,27 +417,20 @@ class ConstellationModal extends StatelessWidget {
             ),
           ),
           Expanded(
-            child: CustomPaint(
-              size: Size.infinite,
-              painter: ConstellationPainter(centerTitle: centerTitle, links: links),
-            ),
-          ),
-          SizedBox(
-            height: 70,
-            child: ListView.builder(
-              scrollDirection: Axis.horizontal,
-              itemCount: links.length,
-              itemBuilder: (ctx, i) => Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 14),
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF1E293B),
-                    foregroundColor: const Color(0xFF38BDF8),
+            child: LayoutBuilder(
+              builder: (ctx, constraints) {
+                final size = Size(constraints.maxWidth, constraints.maxHeight);
+                _calculateNodes(size);
+
+                return GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (details) => _handleTap(details.localPosition),
+                  child: CustomPaint(
+                    size: size,
+                    painter: ConstellationPainter(nodes: _nodes),
                   ),
-                  onPressed: () => onSelectNode(links[i]),
-                  child: Text(links[i]),
-                ),
-              ),
+                );
+              },
             ),
           ),
         ],
@@ -353,16 +440,15 @@ class ConstellationModal extends StatelessWidget {
 }
 
 class ConstellationPainter extends CustomPainter {
-  final String centerTitle;
-  final List<String> links;
+  final List<StarNode> nodes;
 
-  ConstellationPainter({required this.centerTitle, required this.links});
+  ConstellationPainter({required this.nodes});
 
   @override
   void paint(Canvas canvas, Size size) {
-    final cx = size.width / 2;
-    final cy = size.height / 2;
-    final centerOffset = Offset(cx, cy);
+    if (nodes.isEmpty) return;
+
+    final center = nodes.first;
 
     final linePaint = Paint()
       ..color = const Color(0xFF38BDF8).withValues(alpha: 0.25)
@@ -370,22 +456,60 @@ class ConstellationPainter extends CustomPainter {
 
     final starPaint = Paint()..color = const Color(0xFFE0F2FE);
     final centerStarPaint = Paint()..color = const Color(0xFF38BDF8);
+    final haloPaint = Paint()
+      ..color = const Color(0xFF38BDF8).withValues(alpha: 0.20)
+      ..style = PaintingStyle.fill;
 
-    canvas.drawCircle(centerOffset, 16, centerStarPaint);
+    // 1. 接続線の描画
+    for (int i = 1; i < nodes.length; i++) {
+      final node = nodes[i];
+      canvas.drawLine(center.position, node.position, linePaint);
 
-    if (links.isEmpty) return;
+      final next = (i == nodes.length - 1) ? nodes[1] : nodes[i + 1];
+      final perimeterPaint = Paint()
+        ..color = const Color(0xFF94A3B8).withValues(alpha: 0.15)
+        ..strokeWidth = 0.8;
+      canvas.drawLine(node.position, next.position, perimeterPaint);
+    }
 
-    final radius = math.min(size.width, size.height) * 0.36;
-    final count = links.length;
+    // 2. 星と直下ラベルの描画
+    for (final node in nodes) {
+      if (node.isCenter) {
+        canvas.drawCircle(node.position, node.radius + 6, haloPaint);
+        canvas.drawCircle(node.position, node.radius, centerStarPaint);
+      } else {
+        canvas.drawCircle(
+          node.position,
+          node.radius + 3,
+          Paint()..color = Colors.white.withValues(alpha: 0.08),
+        );
+        canvas.drawCircle(node.position, node.radius, starPaint);
+      }
 
-    for (int i = 0; i < count; i++) {
-      final rad = (i / count) * math.pi * 2;
-      final x = cx + math.cos(rad) * radius;
-      final y = cy + math.sin(rad) * radius;
-      final nodeOffset = Offset(x, y);
+      // 直下のテキストラベル描画
+      final displayLabel = node.title.length > 9 ? '${node.title.substring(0, 8)}…' : node.title;
 
-      canvas.drawLine(centerOffset, nodeOffset, linePaint);
-      canvas.drawCircle(nodeOffset, 6, starPaint);
+      final textSpan = TextSpan(
+        text: displayLabel,
+        style: TextStyle(
+          color: node.isCenter ? const Color(0xFF38BDF8) : const Color(0xFFCBD5E1),
+          fontSize: node.isCenter ? 14 : 12,
+          fontWeight: node.isCenter ? FontWeight.bold : FontWeight.normal,
+        ),
+      );
+
+      final textPainter = TextPainter(
+        text: textSpan,
+        textAlign: TextAlign.center,
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: 120);
+
+      final textOffset = Offset(
+        node.position.dx - (textPainter.width / 2),
+        node.position.dy + node.radius + 6.0,
+      );
+
+      textPainter.paint(canvas, textOffset);
     }
   }
 
