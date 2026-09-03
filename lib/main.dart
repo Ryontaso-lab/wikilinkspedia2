@@ -43,14 +43,18 @@ class _WikiAppState extends State<WikiApp> {
         scaffoldBackgroundColor: const Color(0xFF0B0F19),
         primaryColor: const Color(0xFF38BDF8),
       ),
-      home: MainScreen(onToggleTheme: toggleTheme),
+      home: MainScreen(
+        themeMode: _themeMode,
+        onToggleTheme: toggleTheme,
+      ),
     );
   }
 }
 
 class MainScreen extends StatefulWidget {
+  final ThemeMode themeMode;
   final VoidCallback onToggleTheme;
-  const MainScreen({super.key, required this.onToggleTheme});
+  const MainScreen({super.key, required this.themeMode, required this.onToggleTheme});
 
   @override
   State<MainScreen> createState() => _MainScreenState();
@@ -67,12 +71,86 @@ class _MainScreenState extends State<MainScreen> {
 
   StreamSubscription? _intentSub;
 
+  // Wikipedia Webページへ流し込むダークモードCSS
+  static const String _darkModeCss = '''
+    (function() {
+      var existingStyle = document.getElementById('flutter-wiki-dark-theme');
+      if (existingStyle) return;
+      var style = document.createElement('style');
+      style.id = 'flutter-wiki-dark-theme';
+      style.innerHTML = `
+        html, body, #content, .content, .mw-body {
+          background-color: #0b0f19 !important;
+          color: #e2e8f0 !important;
+        }
+        header, .header-container, .navigation-drawer {
+          background-color: #1e293b !important;
+          color: #f8fafc !important;
+          border-color: #334155 !important;
+        }
+        a, a:visited {
+          color: #38bdf8 !important;
+          text-decoration: none !important;
+        }
+        h1, h2, h3, h4, h5, h6, .mw-first-heading {
+          color: #f1f5f9 !important;
+          border-bottom-color: #334155 !important;
+        }
+        table, td, th, .infobox, .wikitable {
+          background-color: #1e293b !important;
+          color: #e2e8f0 !important;
+          border-color: #475569 !important;
+        }
+        th {
+          background-color: #334155 !important;
+        }
+        /* 画像や地図は色反転させずに保護 */
+        img, svg, canvas, .leaflet-container {
+          filter: brightness(0.9) contrast(1.05) !important;
+        }
+      `;
+      document.head.appendChild(style);
+    })();
+  ''';
+
+  // ライトモード復帰用スクリプト
+  static const String _removeDarkCss = '''
+    (function() {
+      var style = document.getElementById('flutter-wiki-dark-theme');
+      if (style) style.remove();
+    })();
+  ''';
+
+  bool get _isDarkNow {
+    if (widget.themeMode == ThemeMode.system) {
+      return WidgetsBinding.instance.platformDispatcher.platformBrightness == Brightness.dark;
+    }
+    return widget.themeMode == ThemeMode.dark;
+  }
+
+  void _applyThemeToWebView() {
+    if (_isDarkNow) {
+      _webCtrl.runJavaScript(_darkModeCss);
+    } else {
+      _webCtrl.runJavaScript(_removeDarkCss);
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant MainScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.themeMode != widget.themeMode) {
+      _applyThemeToWebView();
+    }
+  }
+
   @override
   void initState() {
     super.initState();
 
     _webCtrl = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(const Color(0xFF0B0F19))
       ..setNavigationDelegate(
         NavigationDelegate(
           onNavigationRequest: (NavigationRequest req) {
@@ -87,17 +165,18 @@ class _MainScreenState extends State<MainScreen> {
             }
             return NavigationDecision.navigate;
           },
+          onPageFinished: (String url) {
+            _applyThemeToWebView();
+          },
         ),
       );
 
-    // 共有 ＆ リンク直接タップ受け取り（アプリ常駐時）
     _intentSub = ReceiveSharingIntent.instance.getMediaStream().listen((List<SharedMediaFile> value) {
       if (value.isNotEmpty) {
         _handleSharedPayload(value.first.path);
       }
     }, onError: (_) {});
 
-    // 共有 ＆ リンク直接タップ起動（初回起動時）
     ReceiveSharingIntent.instance.getInitialMedia().then((List<SharedMediaFile> value) {
       if (value.isNotEmpty) {
         _handleSharedPayload(value.first.path);
@@ -114,7 +193,6 @@ class _MainScreenState extends State<MainScreen> {
     super.dispose();
   }
 
-  // 渡された文字列（URLまたは共有テキスト）から記事名を抽出
   void _handleSharedPayload(String payload) {
     String title = '';
     final match = RegExp(r'wikipedia\.org/wiki/([^?#\s]+)').firstMatch(payload);
@@ -240,7 +318,8 @@ class _MainScreenState extends State<MainScreen> {
             onPressed: _fetchRandomArticle,
           ),
           IconButton(
-            icon: const Icon(Icons.brightness_medium),
+            icon: Icon(_isDarkNow ? Icons.light_mode : Icons.dark_mode),
+            tooltip: 'テーマ切り替え',
             onPressed: widget.onToggleTheme,
           ),
         ],
@@ -342,7 +421,7 @@ class _ConstellationModalState extends State<ConstellationModal> {
     final count = widget.links.length;
 
     for (int i = 0; i < count; i++) {
-      final rad = (i / count) * math.pi * 2;
+      final rad = (i / count) * math.PI * 2;
       final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.05);
       final dist = baseDist + offset;
 
@@ -362,14 +441,12 @@ class _ConstellationModalState extends State<ConstellationModal> {
     for (final node in _nodes) {
       if (node.isCenter) continue;
 
-      // 星本体の周囲判定（半径+24px）
       final dist = (node.position - tapPos).distance;
       if (dist <= node.radius + 24.0) {
         widget.onSelectNode(node.title);
         return;
       }
 
-      // 直下ラベル領域の矩形判定
       final textRect = Rect.fromCenter(
         center: Offset(node.position.dx, node.position.dy + node.radius + 14.0),
         width: 100.0,
