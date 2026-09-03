@@ -1,5 +1,5 @@
 name: wiki_constellation
-description: "Wikipedia Constellation Explorer in Flutter"
+description: "Wikipedia Constellation Explorer"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -10,13 +10,8 @@ dependencies:
   flutter:
     sdk: flutter
   http: ^1.2.0
-  flutter_html: ^3.0.0-beta.2
-  receive_sharing_intent: ^1.4.5
-
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^3.0.0
+  webview_flutter: ^4.10.0
+  receive_sharing_intent: ^1.8.1
 
 flutter:
   uses-material-design: true
