@@ -27,40 +27,37 @@ jobs:
           rm -rf android
           flutter create --platforms=android --org com.ryontaso.wikilinks .
           
-          # 1. build.gradle.kts を直接編集して compileSdk を強制的に 37 に指定 & メタデータ検査を抑制
+          # 1. build.gradle.kts を直接編集して compileSdk を 37 に指定
           python3 -c "
           path = 'android/app/build.gradle.kts'
           with open(path, 'r') as f:
               txt = f.read()
 
-          # compileSdk の変数を 37 で直書き置換
           txt = txt.replace('compileSdk = flutter.compileSdkVersion', 'compileSdk = 37')
           txt = txt.replace('targetSdk = flutter.targetSdkVersion', 'targetSdk = 37')
 
-          # 万が一数値で書かれていた場合の置換
           import re
           txt = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 37', txt)
           txt = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 37', txt)
-
-          # checkReleaseAarMetadata による強制停止をバイパスする設定を注入
-          bypass_config = '''
-          android {
-              // Forced SDK 37
-          '''
-          txt = txt.replace('android {', bypass_config)
 
           with open(path, 'w') as f:
               f.write(txt)
           "
 
-          # 2. gradle.properties に AAR 検査の警告停止フラグを注入
+          # 2. gradle.properties に AAR 検査抑制フラグを注入
           echo 'android.suppressUnsupportedCompileSdk=37' >> android/gradle.properties
 
-          # 3. AndroidManifest.xml に共有インテントフィルターを注入
+          # 3. AndroidManifest.xml に「インターネット通信許可」と「共有アンテナ」を両方注入
           python3 -c "
           path = 'android/app/src/main/AndroidManifest.xml'
           with open(path, 'r') as f:
               content = f.read()
+
+          # インターネット通信権限の付与
+          perm = '<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n    <uses-permission android:name=\"android.permission.INTERNET\"/>\n'
+          new_content = content.replace('<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">', perm)
+
+          # 共有メニュー（SENDインテント）の追加
           intent = '''
                       <intent-filter>
                           <action android:name=\"android.intent.action.SEND\" />
@@ -68,7 +65,8 @@ jobs:
                           <data android:mimeType=\"text/plain\" />
                       </intent-filter>
                   </activity>'''
-          new_content = content.replace('</activity>', intent)
+          new_content = new_content.replace('</activity>', intent)
+
           with open(path, 'w') as f:
               f.write(new_content)
           "
