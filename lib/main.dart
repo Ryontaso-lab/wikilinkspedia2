@@ -51,6 +51,14 @@ class _WikiAppState extends State<WikiApp> {
   }
 }
 
+// 探索ログ管理用クラス（記事名とスクロール位置をセットで保持）
+class HistoryItem {
+  final String title;
+  int scrollY;
+
+  HistoryItem({required this.title, this.scrollY = 0});
+}
+
 class MainScreen extends StatefulWidget {
   final ThemeMode themeMode;
   final VoidCallback onToggleTheme;
@@ -65,18 +73,17 @@ class _MainScreenState extends State<MainScreen> {
   late final WebViewController _webCtrl;
 
   String _currentTitle = '読み込み中...';
-  final List<String> _history = [];
+  final List<HistoryItem> _history = [];
   int _currentHistoryIdx = -1;
   List<String> _starLinks = [];
+  int _targetRestoreScrollY = 0; // 復元用スクロール目標値
 
   StreamSubscription? _intentSub;
 
-  // Wikipedia API 必須の User-Agent
   static const Map<String, String> _apiHeaders = {
     'User-Agent': 'WikiConstellationApp/1.0 (https://github.com/ryontaso-lab/wikilinkspedia2; flutter_app)'
   };
 
-  // Wikipedia Webページへ流し込むダークモードCSS
   static const String _darkModeCss = '''
     (function() {
       var existingStyle = document.getElementById('flutter-wiki-dark-theme');
@@ -170,6 +177,16 @@ class _MainScreenState extends State<MainScreen> {
           },
           onPageFinished: (String url) {
             _applyThemeToWebView();
+
+            // 復元先のスクロール位置が指定されていればスクロール
+            if (_targetRestoreScrollY > 0) {
+              final y = _targetRestoreScrollY;
+              _targetRestoreScrollY = 0;
+              // 描画安定を待ってからスクロール
+              Future.delayed(const Duration(milliseconds: 150), () {
+                _webCtrl.runJavaScript('window.scrollTo({top: $y, behavior: "smooth"});');
+              });
+            }
           },
         ),
       );
@@ -210,11 +227,21 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
-  Future<void> _loadArticle(String title, {bool addHistory = true}) async {
+  // 現在の閲覧位置を退避してから記事を切り替える
+  Future<void> _loadArticle(String title, {bool addHistory = true, int restoreScrollY = 0}) async {
     if (title.isEmpty) return;
+
+    // 現在閲覧中の記事があればスクロール位置を取得して履歴に保存
+    if (_currentHistoryIdx >= 0 && _currentHistoryIdx < _history.length) {
+      try {
+        final currentScrollOffset = await _webCtrl.getScrollPosition();
+        _history[_currentHistoryIdx].scrollY = currentScrollOffset.dy.toInt();
+      } catch (_) {}
+    }
 
     setState(() {
       _currentTitle = title;
+      _targetRestoreScrollY = restoreScrollY;
     });
 
     final rawTitle = title.replaceAll(' ', '_');
@@ -224,7 +251,7 @@ class _MainScreenState extends State<MainScreen> {
 
     if (addHistory) {
       setState(() {
-        _history.add(title);
+        _history.add(HistoryItem(title: title, scrollY: 0));
         _currentHistoryIdx = _history.length - 1;
       });
     }
@@ -232,12 +259,10 @@ class _MainScreenState extends State<MainScreen> {
     _fetchStarLinksFromApi(title);
   }
 
-  // 年号や日付・管理用リンクを排除するフィルタリング処理
   Future<void> _fetchStarLinksFromApi(String title) async {
     try {
-      // 候補を広げるため 200 件取得
       final apiUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&prop=links&plnamespace=0&pllimit=200&format=json&titles=${Uri.encodeComponent(title)}'
+        'https://ja.wikipedia.org/w/api.php?action=query&prop=links&plnamespace=0&pllimit=150&format=json&titles=${Uri.encodeComponent(title)}'
       );
       final res = await http.get(apiUrl, headers: _apiHeaders);
       if (res.statusCode == 200) {
@@ -247,21 +272,34 @@ class _MainScreenState extends State<MainScreen> {
           final firstPage = pages.values.first;
           final linksList = firstPage['links'] as List<dynamic>?;
           if (linksList != null) {
-            // 年号、日付、紀元前、一覧系などを除外
-            final filtered = linksList.map((e) => e['title'].toString()).where((t) {
-              if (t.contains(':')) return false; // 特別ページ
-              if (RegExp(r'^\d+年$').hasMatch(t)) return false; // 例: 2024年
-              if (RegExp(r'^\d+月\d+日$').hasMatch(t)) return false; // 例: 8月15日
-              if (RegExp(r'^(明治|大正|昭和|平成|令和)\d+年?$').hasMatch(t)) return false;
-              if (RegExp(r'紀元前\d+年?').hasMatch(t)) return false;
-              if (t.endsWith('の一覧') || t.contains('(曖昧さ回避)')) return false;
-              return true;
-            }).toList();
+            int dateCount = 0;
+            final List<String> result = [];
 
-            // ランダムシャッフルして20件抽出
-            filtered.shuffle();
+            for (final item in linksList) {
+              final t = item['title'].toString();
+              if (t.contains(':') || t.endsWith('の一覧') || t.contains('(曖昧さ回避)')) {
+                continue;
+              }
+
+              final isPureDate = RegExp(r'^\d+年$').hasMatch(t) ||
+                  RegExp(r'^\d+月\d+日$').hasMatch(t) ||
+                  RegExp(r'^(明治|大正|昭和|平成|令和)\d+年?$').hasMatch(t) ||
+                  RegExp(r'紀元前\d+年?').hasMatch(t);
+
+              if (isPureDate) {
+                if (dateCount < 3) {
+                  result.add(t);
+                  dateCount++;
+                }
+              } else {
+                result.add(t);
+              }
+
+              if (result.length >= 20) break;
+            }
+
             setState(() {
-              _starLinks = filtered.take(20).toList();
+              _starLinks = result;
             });
           }
         }
@@ -269,10 +307,8 @@ class _MainScreenState extends State<MainScreen> {
     } catch (_) {}
   }
 
-  // 確実なランダム記事取得（Action API 経由）
   Future<void> _fetchRandomArticle() async {
     try {
-      // 標準名前空間 (namespace=0) の記事のみをランダム抽出
       final apiUrl = Uri.parse(
         'https://ja.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=1&format=json'
       );
@@ -288,7 +324,6 @@ class _MainScreenState extends State<MainScreen> {
       }
     } catch (_) {}
 
-    // 万が一の予備フォールバックリスト（富士山固定を回避）
     const fallbacks = ['宇宙', '深海', 'ピラミッド', '量子力学', 'オーロラ', 'アンモナイト', '人工知能'];
     final pick = fallbacks[math.Random().nextInt(fallbacks.length)];
     _loadArticle(pick);
@@ -356,6 +391,7 @@ class _MainScreenState extends State<MainScreen> {
       ),
       body: Row(
         children: [
+          // 左サイドバー（探索ログ）
           if (isTablet)
             Container(
               width: 260,
@@ -366,18 +402,22 @@ class _MainScreenState extends State<MainScreen> {
                 itemCount: _history.length,
                 itemBuilder: (ctx, i) {
                   final isCurrent = i == _currentHistoryIdx;
+                  final item = _history[i];
                   return ListTile(
                     dense: true,
                     title: Text(
-                      '${i + 1}. ${_history[i]}',
+                      '${i + 1}. ${item.title}',
                       style: TextStyle(
                         fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
                         color: isCurrent ? Theme.of(context).primaryColor : null,
                       ),
                     ),
                     onTap: () {
+                      if (_currentHistoryIdx == i) return;
+                      final targetScrollY = item.scrollY;
                       _currentHistoryIdx = i;
-                      _loadArticle(_history[i], addHistory: false);
+                      // 履歴からの復元時は addHistory: false かつ以前の scrollY を渡す
+                      _loadArticle(item.title, addHistory: false, restoreScrollY: targetScrollY);
                     },
                   );
                 },
