@@ -69,6 +69,7 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> {
   final TextEditingController _searchCtrl = TextEditingController();
+  final ScrollController _chipScrollCtrl = ScrollController();
   late final WebViewController _webCtrl;
 
   String _currentTitle = '読み込み中...';
@@ -190,39 +191,40 @@ class _MainScreenState extends State<MainScreen> {
           onPageFinished: (String url) {
             _applyThemeToWebView();
 
-            // スクロール追跡用リスナー
+            // スクロール追跡用リスナー（パッシブ型）
             _webCtrl.runJavaScript('''
-              window.removeEventListener('scroll', window._flutterScrollTracker);
-              window._flutterScrollTracker = function() {
-                if (window.ScrollTracker) {
-                  window.ScrollTracker.postMessage(Math.round(window.scrollY || window.pageYOffset || 0).toString());
-                }
-              };
-              window.addEventListener('scroll', window._flutterScrollTracker, { passive: true });
+              (function() {
+                var timer;
+                window.addEventListener('scroll', function() {
+                  clearTimeout(timer);
+                  timer = setTimeout(function() {
+                    var y = Math.round(window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);
+                    if (window.ScrollTracker) {
+                      window.ScrollTracker.postMessage(y.toString());
+                    }
+                  }, 50);
+                }, { passive: true });
+              })();
             ''');
 
-            // 確実なスクロール位置復元（HTML高さが確保されるまでポーリング監視）
+            // 粘着スクロール復元（Sticky Restore）：動的高さ変動・内部リセットを監視し目的位置へ押し当てる
             if (_targetRestoreScrollY > 0) {
               final targetY = _targetRestoreScrollY;
               _targetRestoreScrollY = 0;
               _webCtrl.runJavaScript('''
                 (function() {
                   var target = $targetY;
-                  var attempts = 0;
-                  var checker = setInterval(function() {
-                    attempts++;
-                    var docHeight = Math.max(
-                      document.body.scrollHeight || 0,
-                      document.documentElement.scrollHeight || 0
-                    );
-                    // ページの高さが目標値に届いているか、または最大2.5秒試行
-                    if (docHeight >= target || attempts >= 25) {
-                      window.scrollTo(0, target);
-                      if (Math.abs((window.scrollY || window.pageYOffset || 0) - target) < 20 || attempts >= 25) {
-                        clearInterval(checker);
-                      }
+                  var count = 0;
+                  var restoreInterval = setInterval(function() {
+                    count++;
+                    window.scrollTo({ top: target, behavior: 'instant' });
+                    var currentY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+                    if (Math.abs(currentY - target) < 10 || count > 30) {
+                      // 念押しの最終スクロール
+                      window.scrollTo({ top: target, behavior: 'instant' });
+                      clearInterval(restoreInterval);
                     }
-                  }, 100);
+                  }, 80);
                 })();
               ''');
             }
@@ -249,6 +251,7 @@ class _MainScreenState extends State<MainScreen> {
   void dispose() {
     _intentSub?.cancel();
     _searchCtrl.dispose();
+    _chipScrollCtrl.dispose();
     super.dispose();
   }
 
@@ -266,12 +269,20 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
+  // 記事切り替え（現在のスクロール位置を同期してから移動）
   Future<void> _loadArticle(String title, {bool addHistory = true, int restoreScrollY = 0}) async {
     if (title.isEmpty) return;
 
-    // 現在の記事の最新スクロール位置を履歴に確定保存
     if (_currentHistoryIdx >= 0 && _currentHistoryIdx < _history.length) {
-      _history[_currentHistoryIdx].scrollY = _currentScrollY;
+      try {
+        final res = await _webCtrl.runJavaScriptReturningResult(
+          'window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;'
+        );
+        final numVal = int.tryParse(res.toString()) ?? _currentScrollY;
+        _history[_currentHistoryIdx].scrollY = numVal;
+      } catch (_) {
+        _history[_currentHistoryIdx].scrollY = _currentScrollY;
+      }
     }
 
     setState(() {
@@ -289,6 +300,16 @@ class _MainScreenState extends State<MainScreen> {
       setState(() {
         _history.add(HistoryItem(title: title, scrollY: 0));
         _currentHistoryIdx = _history.length - 1;
+      });
+      // 新しい履歴が追加されたらチップバーを一番右へ自動スクロール
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_chipScrollCtrl.hasClients) {
+          _chipScrollCtrl.animateTo(
+            _chipScrollCtrl.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeOut,
+          );
+        }
       });
     }
 
@@ -451,6 +472,7 @@ class _MainScreenState extends State<MainScreen> {
 
     return Scaffold(
       appBar: AppBar(
+        titleSpacing: 8,
         title: TextField(
           controller: _searchCtrl,
           decoration: InputDecoration(
@@ -488,9 +510,62 @@ class _MainScreenState extends State<MainScreen> {
             onPressed: widget.onToggleTheme,
           ),
         ],
+        // スマホ画面用：検索バー直下に横スクロール可能な探索履歴タブバーを配置
+        bottom: isTablet
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(44.0),
+                child: Container(
+                  height: 44.0,
+                  alignment: Alignment.centerLeft,
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).cardColor.withValues(alpha: 0.6),
+                    border: Border(bottom: BorderSide(color: Theme.of(context).dividerColor, width: 0.5)),
+                  ),
+                  child: ListView.builder(
+                    controller: _chipScrollCtrl,
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    itemCount: _history.length,
+                    itemBuilder: (ctx, i) {
+                      final isCurrent = i == _currentHistoryIdx;
+                      final item = _history[i];
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: ActionChip(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          backgroundColor: isCurrent
+                              ? Theme.of(context).primaryColor.withValues(alpha: 0.25)
+                              : Theme.of(context).scaffoldBackgroundColor,
+                          side: BorderSide(
+                            color: isCurrent ? Theme.of(context).primaryColor : Theme.of(context).dividerColor,
+                            width: isCurrent ? 1.5 : 0.8,
+                          ),
+                          label: Text(
+                            '${i + 1}. ${item.title}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                              color: isCurrent ? Theme.of(context).primaryColor : null,
+                            ),
+                          ),
+                          onPressed: () {
+                            if (_currentHistoryIdx == i) return;
+                            final targetScrollY = item.scrollY;
+                            _currentHistoryIdx = i;
+                            _loadArticle(item.title, addHistory: false, restoreScrollY: targetScrollY);
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
       ),
       body: Row(
         children: [
+          // タブレット用：左サイドバー（探索ログ）
           if (isTablet)
             Container(
               width: 260,
