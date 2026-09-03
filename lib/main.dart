@@ -51,11 +51,17 @@ class _WikiAppState extends State<WikiApp> {
   }
 }
 
-class HistoryItem {
+// 記事タブモデル（記事ごとに独立したWebViewControllerをメモリ上に生かしたまま保持）
+class ArticleTab {
   final String title;
-  int scrollY;
+  final WebViewController controller;
+  List<ConstellationItem> starNodes;
 
-  HistoryItem({required this.title, this.scrollY = 0});
+  ArticleTab({
+    required this.title,
+    required this.controller,
+    this.starNodes = const [],
+  });
 }
 
 class MainScreen extends StatefulWidget {
@@ -70,14 +76,9 @@ class MainScreen extends StatefulWidget {
 class _MainScreenState extends State<MainScreen> {
   final TextEditingController _searchCtrl = TextEditingController();
   final ScrollController _chipScrollCtrl = ScrollController();
-  late final WebViewController _webCtrl;
 
-  String _currentTitle = '読み込み中...';
-  final List<HistoryItem> _history = [];
-  int _currentHistoryIdx = -1;
-  List<ConstellationItem> _starNodes = [];
-  int _targetRestoreScrollY = 0;
-  int _currentScrollY = 0;
+  final List<ArticleTab> _tabs = [];
+  int _currentTabIndex = -1;
 
   StreamSubscription? _intentSub;
 
@@ -139,11 +140,13 @@ class _MainScreenState extends State<MainScreen> {
     return widget.themeMode == ThemeMode.dark;
   }
 
-  void _applyThemeToWebView() {
-    if (_isDarkNow) {
-      _webCtrl.runJavaScript(_darkModeCss);
-    } else {
-      _webCtrl.runJavaScript(_removeDarkCss);
+  void _applyThemeToAllControllers() {
+    for (var tab in _tabs) {
+      if (_isDarkNow) {
+        tab.controller.runJavaScript(_darkModeCss);
+      } else {
+        tab.controller.runJavaScript(_removeDarkCss);
+      }
     }
   }
 
@@ -151,86 +154,13 @@ class _MainScreenState extends State<MainScreen> {
   void didUpdateWidget(covariant MainScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.themeMode != widget.themeMode) {
-      _applyThemeToWebView();
+      _applyThemeToAllControllers();
     }
   }
 
   @override
   void initState() {
     super.initState();
-
-    _webCtrl = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setBackgroundColor(const Color(0xFF0B0F19))
-      ..addJavaScriptChannel(
-        'ScrollTracker',
-        onMessageReceived: (JavaScriptMessage msg) {
-          final val = int.tryParse(msg.message);
-          if (val != null) {
-            _currentScrollY = val;
-            if (_currentHistoryIdx >= 0 && _currentHistoryIdx < _history.length) {
-              _history[_currentHistoryIdx].scrollY = val;
-            }
-          }
-        },
-      )
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onNavigationRequest: (NavigationRequest req) {
-            final url = req.url;
-            if (url.contains('wikipedia.org/wiki/')) {
-              final raw = url.split('/wiki/').last.split('#').first.split('?').first;
-              final clean = Uri.decodeComponent(raw).replaceAll('_', ' ');
-              if (clean != _currentTitle) {
-                _loadArticle(clean);
-                return NavigationDecision.prevent;
-              }
-            }
-            return NavigationDecision.navigate;
-          },
-          onPageFinished: (String url) {
-            _applyThemeToWebView();
-
-            // スクロール追跡用リスナー（パッシブ型）
-            _webCtrl.runJavaScript('''
-              (function() {
-                var timer;
-                window.addEventListener('scroll', function() {
-                  clearTimeout(timer);
-                  timer = setTimeout(function() {
-                    var y = Math.round(window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);
-                    if (window.ScrollTracker) {
-                      window.ScrollTracker.postMessage(y.toString());
-                    }
-                  }, 50);
-                }, { passive: true });
-              })();
-            ''');
-
-            // 粘着スクロール復元（Sticky Restore）：動的高さ変動・内部リセットを監視し目的位置へ押し当てる
-            if (_targetRestoreScrollY > 0) {
-              final targetY = _targetRestoreScrollY;
-              _targetRestoreScrollY = 0;
-              _webCtrl.runJavaScript('''
-                (function() {
-                  var target = $targetY;
-                  var count = 0;
-                  var restoreInterval = setInterval(function() {
-                    count++;
-                    window.scrollTo({ top: target, behavior: 'instant' });
-                    var currentY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
-                    if (Math.abs(currentY - target) < 10 || count > 30) {
-                      // 念押しの最終スクロール
-                      window.scrollTo({ top: target, behavior: 'instant' });
-                      clearInterval(restoreInterval);
-                    }
-                  }, 80);
-                })();
-              ''');
-            }
-          },
-        ),
-      );
 
     _intentSub = ReceiveSharingIntent.instance.getMediaStream().listen((List<SharedMediaFile> value) {
       if (value.isNotEmpty) {
@@ -265,58 +195,81 @@ class _MainScreenState extends State<MainScreen> {
     }
 
     if (title.isNotEmpty) {
-      _loadArticle(title);
+      _openNewArticleTab(title);
     }
   }
 
-  // 記事切り替え（現在のスクロール位置を同期してから移動）
-  Future<void> _loadArticle(String title, {bool addHistory = true, int restoreScrollY = 0}) async {
+  // 完全に新しいタブ（独立WebView）を作成して開く
+  void _openNewArticleTab(String title) {
     if (title.isEmpty) return;
 
-    if (_currentHistoryIdx >= 0 && _currentHistoryIdx < _history.length) {
-      try {
-        final res = await _webCtrl.runJavaScriptReturningResult(
-          'window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;'
-        );
-        final numVal = int.tryParse(res.toString()) ?? _currentScrollY;
-        _history[_currentHistoryIdx].scrollY = numVal;
-      } catch (_) {
-        _history[_currentHistoryIdx].scrollY = _currentScrollY;
-      }
+    // 既に履歴内に同じタイトルが存在する場合は、新しく作らずそのタブへ瞬時に切り替え
+    final existingIndex = _tabs.indexWhere((t) => t.title == title);
+    if (existingIndex != -1) {
+      _switchToTab(existingIndex);
+      return;
     }
-
-    setState(() {
-      _currentTitle = title;
-      _targetRestoreScrollY = restoreScrollY;
-      _currentScrollY = restoreScrollY;
-    });
 
     final rawTitle = title.replaceAll(' ', '_');
     final directUrl = 'https://ja.m.wikipedia.org/wiki/${Uri.encodeComponent(rawTitle)}';
 
-    _webCtrl.loadRequest(Uri.parse(directUrl));
+    late final WebViewController ctrl;
+    ctrl = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(const Color(0xFF0B0F19))
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onNavigationRequest: (NavigationRequest req) {
+            final url = req.url;
+            if (url.contains('wikipedia.org/wiki/')) {
+              final raw = url.split('/wiki/').last.split('#').first.split('?').first;
+              final clean = Uri.decodeComponent(raw).replaceAll('_', ' ');
+              if (clean != title) {
+                _openNewArticleTab(clean);
+                return NavigationDecision.prevent;
+              }
+            }
+            return NavigationDecision.navigate;
+          },
+          onPageFinished: (String url) {
+            if (_isDarkNow) {
+              ctrl.runJavaScript(_darkModeCss);
+            }
+          },
+        ),
+      )
+      ..loadRequest(Uri.parse(directUrl));
 
-    if (addHistory) {
-      setState(() {
-        _history.add(HistoryItem(title: title, scrollY: 0));
-        _currentHistoryIdx = _history.length - 1;
-      });
-      // 新しい履歴が追加されたらチップバーを一番右へ自動スクロール
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_chipScrollCtrl.hasClients) {
-          _chipScrollCtrl.animateTo(
-            _chipScrollCtrl.position.maxScrollExtent,
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeOut,
-          );
-        }
-      });
-    }
+    final newTab = ArticleTab(title: title, controller: ctrl);
 
-    _fetchVerifiedConstellation(title);
+    setState(() {
+      _tabs.add(newTab);
+      _currentTabIndex = _tabs.length - 1;
+    });
+
+    _fetchVerifiedConstellation(title, newTab);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_chipScrollCtrl.hasClients) {
+        _chipScrollCtrl.animateTo(
+          _chipScrollCtrl.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
   }
 
-  Future<void> _fetchVerifiedConstellation(String title) async {
+  // 以前のタブへ切り替える（破棄せずメモリに残っていたWebViewを最前面に出すだけなので100%位置保持）
+  void _switchToTab(int index) {
+    if (index < 0 || index >= _tabs.length || index == _currentTabIndex) return;
+
+    setState(() {
+      _currentTabIndex = index;
+    });
+  }
+
+  Future<void> _fetchVerifiedConstellation(String title, ArticleTab targetTab) async {
     try {
       final catUrl = Uri.parse(
         'https://ja.wikipedia.org/w/api.php?action=query&prop=categories&cllimit=40&format=json&titles=${Uri.encodeComponent(title)}'
@@ -423,7 +376,7 @@ class _MainScreenState extends State<MainScreen> {
       }
 
       setState(() {
-        _starNodes = finalized;
+        targetTab.starNodes = finalized;
       });
     } catch (_) {}
   }
@@ -439,7 +392,7 @@ class _MainScreenState extends State<MainScreen> {
         final items = data['query']?['random'] as List<dynamic>?;
         if (items != null && items.isNotEmpty) {
           final title = items[0]['title'].toString().replaceAll('_', ' ');
-          _loadArticle(title);
+          _openNewArticleTab(title);
           return;
         }
       }
@@ -447,20 +400,23 @@ class _MainScreenState extends State<MainScreen> {
 
     const fallbacks = ['深海魚', 'ピラミッド', '量子コンピュータ', 'オーロラ', 'アンモナイト', '火星探査'];
     final pick = fallbacks[math.Random().nextInt(fallbacks.length)];
-    _loadArticle(pick);
+    _openNewArticleTab(pick);
   }
 
   void _openConstellation() {
+    if (_currentTabIndex < 0 || _currentTabIndex >= _tabs.length) return;
+    final currentTab = _tabs[_currentTabIndex];
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (ctx) => ConstellationModal(
-        centerTitle: _currentTitle,
-        items: _starNodes,
+        centerTitle: currentTab.title,
+        items: currentTab.starNodes,
         onSelectNode: (selected) {
           Navigator.pop(ctx);
-          _loadArticle(selected);
+          _openNewArticleTab(selected);
         },
       ),
     );
@@ -469,6 +425,9 @@ class _MainScreenState extends State<MainScreen> {
   @override
   Widget build(BuildContext context) {
     final isTablet = MediaQuery.of(context).size.width >= 768;
+    final currentTitle = _currentTabIndex >= 0 && _currentTabIndex < _tabs.length
+        ? _tabs[_currentTabIndex].title
+        : '読み込み中...';
 
     return Scaffold(
       appBar: AppBar(
@@ -482,7 +441,7 @@ class _MainScreenState extends State<MainScreen> {
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
           ),
           onSubmitted: (v) {
-            if (v.trim().isNotEmpty) _loadArticle(v.trim());
+            if (v.trim().isNotEmpty) _openNewArticleTab(v.trim());
           },
         ),
         actions: [
@@ -490,7 +449,7 @@ class _MainScreenState extends State<MainScreen> {
             icon: const Icon(Icons.search),
             onPressed: () {
               if (_searchCtrl.text.trim().isNotEmpty) {
-                _loadArticle(_searchCtrl.text.trim());
+                _openNewArticleTab(_searchCtrl.text.trim());
               }
             },
           ),
@@ -510,7 +469,7 @@ class _MainScreenState extends State<MainScreen> {
             onPressed: widget.onToggleTheme,
           ),
         ],
-        // スマホ画面用：検索バー直下に横スクロール可能な探索履歴タブバーを配置
+        // スマホ用：探索履歴チップバー
         bottom: isTablet
             ? null
             : PreferredSize(
@@ -526,10 +485,10 @@ class _MainScreenState extends State<MainScreen> {
                     controller: _chipScrollCtrl,
                     scrollDirection: Axis.horizontal,
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    itemCount: _history.length,
+                    itemCount: _tabs.length,
                     itemBuilder: (ctx, i) {
-                      final isCurrent = i == _currentHistoryIdx;
-                      final item = _history[i];
+                      final isCurrent = i == _currentTabIndex;
+                      final tab = _tabs[i];
                       return Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 4),
                         child: ActionChip(
@@ -543,19 +502,14 @@ class _MainScreenState extends State<MainScreen> {
                             width: isCurrent ? 1.5 : 0.8,
                           ),
                           label: Text(
-                            '${i + 1}. ${item.title}',
+                            '${i + 1}. ${tab.title}',
                             style: TextStyle(
                               fontSize: 12,
                               fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
                               color: isCurrent ? Theme.of(context).primaryColor : null,
                             ),
                           ),
-                          onPressed: () {
-                            if (_currentHistoryIdx == i) return;
-                            final targetScrollY = item.scrollY;
-                            _currentHistoryIdx = i;
-                            _loadArticle(item.title, addHistory: false, restoreScrollY: targetScrollY);
-                          },
+                          onPressed: () => _switchToTab(i),
                         ),
                       );
                     },
@@ -573,31 +527,32 @@ class _MainScreenState extends State<MainScreen> {
                 border: Border(right: BorderSide(color: Theme.of(context).dividerColor)),
               ),
               child: ListView.builder(
-                itemCount: _history.length,
+                itemCount: _tabs.length,
                 itemBuilder: (ctx, i) {
-                  final isCurrent = i == _currentHistoryIdx;
-                  final item = _history[i];
+                  final isCurrent = i == _currentTabIndex;
+                  final tab = _tabs[i];
                   return ListTile(
                     dense: true,
                     title: Text(
-                      '${i + 1}. ${item.title}',
+                      '${i + 1}. ${tab.title}',
                       style: TextStyle(
                         fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
                         color: isCurrent ? Theme.of(context).primaryColor : null,
                       ),
                     ),
-                    onTap: () {
-                      if (_currentHistoryIdx == i) return;
-                      final targetScrollY = item.scrollY;
-                      _currentHistoryIdx = i;
-                      _loadArticle(item.title, addHistory: false, restoreScrollY: targetScrollY);
-                    },
+                    onTap: () => _switchToTab(i),
                   );
                 },
               ),
             ),
+          // 重ね合わせ表示（IndexedStack）：過去のWebViewを一切再描画・再破棄せずそのまま保持
           Expanded(
-            child: WebViewWidget(controller: _webCtrl),
+            child: _tabs.isEmpty
+                ? const Center(child: CircularProgressIndicator())
+                : IndexedStack(
+                    index: _currentTabIndex,
+                    children: _tabs.map((tab) => WebViewWidget(controller: tab.controller)).toList(),
+                  ),
           ),
         ],
       ),
