@@ -22,10 +22,28 @@ jobs:
         with:
           channel: 'stable'
 
-      # 不足しているAndroidの最新テンプレート一式を自動補完
-      - name: Repair and Generate Android Scaffold
+      # 古い/不完全なandroidフォルダを一旦リセットして完全な最新土台を生成
+      - name: Recreate Clean Android Scaffold
         run: |
-          flutter create --platforms=android .
+          rm -rf android
+          flutter create --platforms=android --org com.ryontaso.wikilinks .
+          
+          # 生成された AndroidManifest.xml に共有受け取りアンテナを自動注入
+          python3 -c "
+          path = 'android/app/src/main/AndroidManifest.xml'
+          with open(path, 'r') as f:
+              content = f.read()
+          intent = '''
+                      <intent-filter>
+                          <action android:name=\"android.intent.action.SEND\" />
+                          <category android:name=\"android.intent.category.DEFAULT\" />
+                          <data android:mimeType=\"text/plain\" />
+                      </intent-filter>
+                  </activity>'''
+          new_content = content.replace('</activity>', intent)
+          with open(path, 'w') as f:
+              f.write(new_content)
+          "
 
       - name: Install dependencies
         run: flutter pub get
