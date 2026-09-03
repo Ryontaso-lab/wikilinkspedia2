@@ -22,6 +22,11 @@ jobs:
         with:
           channel: 'stable'
 
+      # 不足しているAndroidの最新テンプレート一式を自動補完
+      - name: Repair and Generate Android Scaffold
+        run: |
+          flutter create --platforms=android .
+
       - name: Install dependencies
         run: flutter pub get
 
