@@ -71,6 +71,11 @@ class _MainScreenState extends State<MainScreen> {
 
   StreamSubscription? _intentSub;
 
+  // Wikipedia API 必須の User-Agent
+  static const Map<String, String> _apiHeaders = {
+    'User-Agent': 'WikiConstellationApp/1.0 (https://github.com/ryontaso-lab/wikilinkspedia2; flutter_app)'
+  };
+
   // Wikipedia Webページへ流し込むダークモードCSS
   static const String _darkModeCss = '''
     (function() {
@@ -227,12 +232,14 @@ class _MainScreenState extends State<MainScreen> {
     _fetchStarLinksFromApi(title);
   }
 
+  // 年号や日付・管理用リンクを排除するフィルタリング処理
   Future<void> _fetchStarLinksFromApi(String title) async {
     try {
+      // 候補を広げるため 200 件取得
       final apiUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&prop=links&pllimit=20&format=json&titles=${Uri.encodeComponent(title)}'
+        'https://ja.wikipedia.org/w/api.php?action=query&prop=links&plnamespace=0&pllimit=200&format=json&titles=${Uri.encodeComponent(title)}'
       );
-      final res = await http.get(apiUrl);
+      final res = await http.get(apiUrl, headers: _apiHeaders);
       if (res.statusCode == 200) {
         final data = json.decode(res.body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -240,8 +247,21 @@ class _MainScreenState extends State<MainScreen> {
           final firstPage = pages.values.first;
           final linksList = firstPage['links'] as List<dynamic>?;
           if (linksList != null) {
+            // 年号、日付、紀元前、一覧系などを除外
+            final filtered = linksList.map((e) => e['title'].toString()).where((t) {
+              if (t.contains(':')) return false; // 特別ページ
+              if (RegExp(r'^\d+年$').hasMatch(t)) return false; // 例: 2024年
+              if (RegExp(r'^\d+月\d+日$').hasMatch(t)) return false; // 例: 8月15日
+              if (RegExp(r'^(明治|大正|昭和|平成|令和)\d+年?$').hasMatch(t)) return false;
+              if (RegExp(r'紀元前\d+年?').hasMatch(t)) return false;
+              if (t.endsWith('の一覧') || t.contains('(曖昧さ回避)')) return false;
+              return true;
+            }).toList();
+
+            // ランダムシャッフルして20件抽出
+            filtered.shuffle();
             setState(() {
-              _starLinks = linksList.map((e) => e['title'].toString()).toList();
+              _starLinks = filtered.take(20).toList();
             });
           }
         }
@@ -249,17 +269,29 @@ class _MainScreenState extends State<MainScreen> {
     } catch (_) {}
   }
 
+  // 確実なランダム記事取得（Action API 経由）
   Future<void> _fetchRandomArticle() async {
     try {
-      final res = await http.get(Uri.parse('https://ja.wikipedia.org/api/rest_v1/page/random/title'));
+      // 標準名前空間 (namespace=0) の記事のみをランダム抽出
+      final apiUrl = Uri.parse(
+        'https://ja.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=1&format=json'
+      );
+      final res = await http.get(apiUrl, headers: _apiHeaders);
       if (res.statusCode == 200) {
         final data = json.decode(res.body);
-        final title = data['items'][0]['title'].toString().replaceAll('_', ' ');
-        _loadArticle(title);
-        return;
+        final items = data['query']?['random'] as List<dynamic>?;
+        if (items != null && items.isNotEmpty) {
+          final title = items[0]['title'].toString().replaceAll('_', ' ');
+          _loadArticle(title);
+          return;
+        }
       }
     } catch (_) {}
-    _loadArticle('富士山');
+
+    // 万が一の予備フォールバックリスト（富士山固定を回避）
+    const fallbacks = ['宇宙', '深海', 'ピラミッド', '量子力学', 'オーロラ', 'アンモナイト', '人工知能'];
+    final pick = fallbacks[math.Random().nextInt(fallbacks.length)];
+    _loadArticle(pick);
   }
 
   void _openConstellation() {
@@ -419,7 +451,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
     final count = widget.links.length;
 
     for (int i = 0; i < count; i++) {
-      // math.pi に修正
       final rad = (i / count) * math.pi * 2;
       final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.05);
       final dist = baseDist + offset;
