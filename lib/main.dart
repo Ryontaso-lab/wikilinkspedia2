@@ -193,7 +193,7 @@ class _MainScreenState extends State<MainScreen> {
       if (value.isNotEmpty) {
         _handleSharedPayload(value.first.path);
       } else {
-        _fetchRandomArticle();
+        _openNewArticleTab('メインページ');
       }
     });
   }
@@ -286,18 +286,51 @@ class _MainScreenState extends State<MainScreen> {
     });
   }
 
-  // 規格・ISO・識別コード・日付を除外（条約や協定は許可）
+  void _resetAllTabs() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: const Text('探索のリセット', style: TextStyle(color: Colors.white)),
+        content: const Text(
+          'これまでの探索タブをすべてクリアして、トップページからやり直しますか？',
+          style: TextStyle(color: Color(0xFFCBD5E1)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('キャンセル', style: TextStyle(color: Color(0xFF94A3B8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () {
+              Navigator.pop(ctx);
+              setState(() {
+                _tabs.clear();
+                _currentTabIndex = -1;
+              });
+              _searchCtrl.clear();
+              _openNewArticleTab('メインページ');
+            },
+            child: const Text('リセット'),
+          ),
+        ],
+      ),
+    );
+  }
+
   bool _isJunkOrStandard(String title) {
     if (title.contains(':') || title.endsWith('の一覧') || title.contains('(曖昧さ回避)')) return true;
 
-    // ISO・JIS・工業規格・識別番号などの工業ノイズのみ遮断（条約・協定・議定書は通過）
     final standardPattern = RegExp(
       r'(ISO|JIS|IEC|RFC|IEEE|DIN|ASTM|GB|工業標準|工業規格|国際標準化機構|コード|識別子|番号体系|仕様書)',
       caseSensitive: false,
     );
     if (standardPattern.hasMatch(title)) return true;
 
-    // 日付・年号・時代区分の遮断
     final isDate = RegExp(r'^\d+年$').hasMatch(title) ||
         RegExp(r'^\d+月(\d+日)?$').hasMatch(title) ||
         RegExp(r'^(明治|大正|昭和|平成|令和)\d+年?$').hasMatch(title) ||
@@ -309,7 +342,6 @@ class _MainScreenState extends State<MainScreen> {
     return false;
   }
 
-  // 星座候補の取得 ＆ 画像付き検証
   Future<void> _fetchVerifiedConstellation(String title, ArticleTab targetTab) async {
     try {
       final catUrl = Uri.parse(
@@ -328,7 +360,6 @@ class _MainScreenState extends State<MainScreen> {
       final List<String> rawConcrete = [];
       final List<String> rawSerendipity = [];
 
-      // 1. 上位概念（カテゴリ）
       if (resList[0].statusCode == 200) {
         final data = json.decode(resList[0].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -351,7 +382,6 @@ class _MainScreenState extends State<MainScreen> {
         }
       }
 
-      // 2. 下位深掘り ＆ 意外な繋がり（本文リンク）
       if (resList[1].statusCode == 200) {
         final data = json.decode(resList[1].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -363,10 +393,8 @@ class _MainScreenState extends State<MainScreen> {
                 .where((t) => !_isJunkOrStandard(t))
                 .toList();
 
-            // 前半（直結トピック＝下位深掘り）
             rawConcrete.addAll(validLinks.take(40));
 
-            // 後半（周辺トピック・派生文化・歴史的出来事＝意外な繋がり）
             if (validLinks.length > 40) {
               final tailLinks = validLinks.skip(40).toList()..shuffle();
               rawSerendipity.addAll(tailLinks.take(20));
@@ -383,9 +411,8 @@ class _MainScreenState extends State<MainScreen> {
 
       if (combined.isEmpty) return;
 
-      // 3. APIで実在確認 ＋ サムネイル画像URLを一括取得
       final verifyUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&prop=pageimages&pithumbsize=120&titles=${Uri.encodeComponent(combined.join('|'))}&format=json'
+        'https://ja.wikipedia.org/w/api.php?action=query&prop=pageimages&pithumbsize=160&titles=${Uri.encodeComponent(combined.join('|'))}&format=json'
       );
       final verifyRes = await http.get(verifyUrl, headers: _apiHeaders);
 
@@ -406,7 +433,6 @@ class _MainScreenState extends State<MainScreen> {
 
       final List<ConstellationItem> finalized = [];
 
-      // 上位概念（紫）最大5件
       for (final ab in rawAbstract) {
         if (validArticlesWithThumb.containsKey(ab) &&
             finalized.where((e) => e.type == NodeType.abstractNode).length < 5) {
@@ -418,7 +444,6 @@ class _MainScreenState extends State<MainScreen> {
         }
       }
 
-      // 下位深掘り（水色）最大9件
       for (final con in rawConcrete) {
         if (validArticlesWithThumb.containsKey(con) &&
             !finalized.any((e) => e.title == con) &&
@@ -431,7 +456,6 @@ class _MainScreenState extends State<MainScreen> {
         }
       }
 
-      // 意外な繋がり（橙色）最大4件
       for (final seren in rawSerendipity) {
         if (validArticlesWithThumb.containsKey(seren) &&
             !finalized.any((e) => e.title == seren) &&
@@ -530,6 +554,11 @@ class _MainScreenState extends State<MainScreen> {
             onPressed: _fetchRandomArticle,
           ),
           IconButton(
+            icon: const Icon(Icons.delete_sweep, color: Colors.redAccent),
+            tooltip: '探索リセット',
+            onPressed: _resetAllTabs,
+          ),
+          IconButton(
             icon: Icon(_isDarkNow ? Icons.light_mode : Icons.dark_mode),
             tooltip: 'テーマ切り替え',
             onPressed: widget.onToggleTheme,
@@ -624,7 +653,7 @@ class _MainScreenState extends State<MainScreen> {
 }
 
 // ----------------------------------------------------
-// 星座モーダル ＆ 画像付きカスタムペインター
+// 星座モーダル（拡大縮小・パン移動 ＆ 1.5倍サムネイル対応）
 // ----------------------------------------------------
 class StarNode {
   final String title;
@@ -660,11 +689,18 @@ class ConstellationModal extends StatefulWidget {
 
 class _ConstellationModalState extends State<ConstellationModal> {
   final Map<String, ui.Image> _loadedImages = {};
+  final TransformationController _transformCtrl = TransformationController();
 
   @override
   void initState() {
     super.initState();
     _preloadThumbnailImages();
+  }
+
+  @override
+  void dispose() {
+    _transformCtrl.dispose();
+    super.dispose();
   }
 
   void _preloadThumbnailImages() {
@@ -701,7 +737,8 @@ class _ConstellationModalState extends State<ConstellationModal> {
     final cy = size.height / 2;
     final isTablet = size.width >= 768;
 
-    final centerR = isTablet ? 22.0 : 18.0;
+    // 中心星：1.5倍（22->33, 18->27）
+    final centerR = isTablet ? 33.0 : 27.0;
 
     nodes.add(StarNode(
       title: widget.centerTitle,
@@ -720,19 +757,20 @@ class _ConstellationModalState extends State<ConstellationModal> {
 
       double baseDist;
       double r;
+      // 周囲星：1.5倍に拡大
       switch (item.type) {
         case NodeType.abstractNode:
           baseDist = minDim * (isTablet ? 0.44 : 0.42);
-          r = isTablet ? 14.0 : 12.0;
+          r = isTablet ? 21.0 : 18.0; // 14->21, 12->18
           break;
         case NodeType.serendipity:
           baseDist = minDim * (isTablet ? 0.36 : 0.34);
-          r = isTablet ? 13.0 : 11.0;
+          r = isTablet ? 19.5 : 16.5; // 13->19.5, 11->16.5
           break;
         case NodeType.concreteNode:
         default:
           baseDist = minDim * (isTablet ? 0.28 : 0.26);
-          r = isTablet ? 12.0 : 10.0;
+          r = isTablet ? 18.0 : 15.0; // 12->18, 10->15
           break;
       }
 
@@ -754,22 +792,25 @@ class _ConstellationModalState extends State<ConstellationModal> {
     return nodes;
   }
 
-  void _handleTap(Offset tapPos, List<StarNode> nodes) {
+  // ズーム・パン後の座標を正確に逆変換してタップ判定
+  void _handleTap(Offset globalTapPos, List<StarNode> nodes) {
+    final scenePos = _transformCtrl.toScene(globalTapPos);
+
     for (final node in nodes) {
       if (node.type == NodeType.center) continue;
 
-      final dist = (node.position - tapPos).distance;
-      if (dist <= node.radius + 24.0) {
+      final dist = (node.position - scenePos).distance;
+      if (dist <= node.radius + 20.0) {
         widget.onSelectNode(node.title);
         return;
       }
 
       final textRect = Rect.fromCenter(
-        center: Offset(node.position.dx, node.position.dy + node.radius + 14.0),
-        width: 100.0,
-        height: 28.0,
+        center: Offset(node.position.dx, node.position.dy + node.radius + 16.0),
+        width: 120.0,
+        height: 32.0,
       );
-      if (textRect.contains(tapPos)) {
+      if (textRect.contains(scenePos)) {
         widget.onSelectNode(node.title);
         return;
       }
@@ -803,7 +844,7 @@ class _ConstellationModalState extends State<ConstellationModal> {
                       ),
                       const SizedBox(width: 8),
                       const Text(
-                        '紫:大枠 / 青:深掘 / 橙:意外性',
+                        '紫:大枠 / 青:深掘 / 橙:意外性 (ピンチで拡大縮小)',
                         style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
                       ),
                     ],
@@ -822,12 +863,18 @@ class _ConstellationModalState extends State<ConstellationModal> {
                 final size = Size(constraints.maxWidth, constraints.maxHeight);
                 final nodes = _buildNodes(size);
 
-                return GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTapDown: (details) => _handleTap(details.localPosition, nodes),
-                  child: CustomPaint(
-                    size: size,
-                    painter: VisualConstellationPainter(nodes: nodes),
+                return InteractiveViewer(
+                  transformationController: _transformCtrl,
+                  minScale: 0.6,
+                  maxScale: 3.5,
+                  boundaryMargin: const EdgeInsets.all(120),
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTapUp: (details) => _handleTap(details.localPosition, nodes),
+                    child: CustomPaint(
+                      size: size,
+                      painter: VisualConstellationPainter(nodes: nodes),
+                    ),
                   ),
                 );
               },
@@ -854,6 +901,7 @@ class VisualConstellationPainter extends CustomPainter {
       ..color = const Color(0xFF38BDF8).withValues(alpha: 0.18)
       ..strokeWidth = 1.0;
 
+    // 1. 星座ライン
     for (int i = 1; i < nodes.length; i++) {
       final node = nodes[i];
       canvas.drawLine(center.position, node.position, linePaint);
@@ -865,6 +913,7 @@ class VisualConstellationPainter extends CustomPainter {
       canvas.drawLine(node.position, next.position, perimeterPaint);
     }
 
+    // 2. 星と画像の描画
     for (final node in nodes) {
       Color themeColor;
       Color glowColor;
@@ -889,8 +938,10 @@ class VisualConstellationPainter extends CustomPainter {
           break;
       }
 
-      canvas.drawCircle(node.position, node.radius + 4, Paint()..color = glowColor);
+      // 外周グロー（1.5倍の星に合わせて少し広めに）
+      canvas.drawCircle(node.position, node.radius + 5, Paint()..color = glowColor);
 
+      // サムネイル画像があれば円形クリップして描画
       if (node.image != null) {
         canvas.save();
         final clipPath = Path()..addOval(Rect.fromCircle(center: node.position, radius: node.radius));
@@ -904,19 +955,21 @@ class VisualConstellationPainter extends CustomPainter {
         final borderPaint = Paint()
           ..color = themeColor
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.2;
+          ..strokeWidth = 2.6; // 視認性を高めるため少し太めに
         canvas.drawCircle(node.position, node.radius, borderPaint);
       } else {
+        // 画像がない場合のフォールバック（光る星）
         final baseStarPaint = Paint()..color = themeColor;
         canvas.drawCircle(node.position, node.radius, baseStarPaint);
       }
 
+      // ラベルテキスト描画
       final displayLabel = node.title.length > 8 ? '${node.title.substring(0, 7)}…' : node.title;
       final textSpan = TextSpan(
         text: displayLabel,
         style: TextStyle(
           color: node.type == NodeType.center ? const Color(0xFF38BDF8) : themeColor,
-          fontSize: node.type == NodeType.center ? 14 : 11,
+          fontSize: node.type == NodeType.center ? 14 : 11.5,
           fontWeight: (node.type == NodeType.center || node.type == NodeType.abstractNode)
               ? FontWeight.bold
               : FontWeight.normal,
@@ -927,11 +980,11 @@ class VisualConstellationPainter extends CustomPainter {
         text: textSpan,
         textAlign: TextAlign.center,
         textDirection: TextDirection.ltr,
-      )..layout(maxWidth: 120);
+      )..layout(maxWidth: 130);
 
       final textOffset = Offset(
         node.position.dx - (textPainter.width / 2),
-        node.position.dy + node.radius + 6.0,
+        node.position.dy + node.radius + 7.0,
       );
 
       textPainter.paint(canvas, textOffset);
