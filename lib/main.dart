@@ -19,12 +19,41 @@ class WikiApp extends StatefulWidget {
   State<WikiApp> createState() => _WikiAppState();
 }
 
-class _WikiAppState extends State<WikiApp> {
-  ThemeMode _themeMode = ThemeMode.dark;
+class _WikiAppState extends State<WikiApp> with WidgetsBindingObserver {
+  // 初期状態を端末設定追従（system）に設定
+  ThemeMode _themeMode = ThemeMode.system;
 
-  void toggleTheme() {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // 端末のダーク/ライトモード切り替えをリアルタイム検知
+  @override
+  void didChangePlatformBrightness() {
+    super.didChangePlatformBrightness();
+    if (_themeMode == ThemeMode.system) {
+      setState(() {});
+    }
+  }
+
+  // 自動(system) -> ダーク(dark) -> ライト(light) の3段階トグル
+  void cycleTheme() {
     setState(() {
-      _themeMode = _themeMode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+      if (_themeMode == ThemeMode.system) {
+        _themeMode = ThemeMode.dark;
+      } else if (_themeMode == ThemeMode.dark) {
+        _themeMode = ThemeMode.light;
+      } else {
+        _themeMode = ThemeMode.system;
+      }
     });
   }
 
@@ -46,7 +75,7 @@ class _WikiAppState extends State<WikiApp> {
       ),
       home: MainScreen(
         themeMode: _themeMode,
-        onToggleTheme: toggleTheme,
+        onCycleTheme: cycleTheme,
       ),
     );
   }
@@ -87,14 +116,14 @@ class ArticleTab {
 
 class MainScreen extends StatefulWidget {
   final ThemeMode themeMode;
-  final VoidCallback onToggleTheme;
-  const MainScreen({super.key, required this.themeMode, required this.onToggleTheme});
+  final VoidCallback onCycleTheme;
+  const MainScreen({super.key, required this.themeMode, required this.onCycleTheme});
 
   @override
   State<MainScreen> createState() => _MainScreenState();
 }
 
-class _MainScreenState extends State<MainScreen> {
+class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   final TextEditingController _searchCtrl = TextEditingController();
   final ScrollController _chipScrollCtrl = ScrollController();
 
@@ -172,6 +201,14 @@ class _MainScreenState extends State<MainScreen> {
   }
 
   @override
+  void didChangePlatformBrightness() {
+    super.didChangePlatformBrightness();
+    if (widget.themeMode == ThemeMode.system) {
+      _applyThemeToAllControllers();
+    }
+  }
+
+  @override
   void didUpdateWidget(covariant MainScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.themeMode != widget.themeMode) {
@@ -182,6 +219,7 @@ class _MainScreenState extends State<MainScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
     _intentSub = ReceiveSharingIntent.instance.getMediaStream().listen((List<SharedMediaFile> value) {
       if (value.isNotEmpty) {
@@ -200,6 +238,7 @@ class _MainScreenState extends State<MainScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _intentSub?.cancel();
     _searchCtrl.dispose();
     _chipScrollCtrl.dispose();
@@ -519,6 +558,19 @@ class _MainScreenState extends State<MainScreen> {
   Widget build(BuildContext context) {
     final isTablet = MediaQuery.of(context).size.width >= 768;
 
+    IconData themeIcon;
+    String themeTooltip;
+    if (widget.themeMode == ThemeMode.system) {
+      themeIcon = Icons.brightness_auto;
+      themeTooltip = 'テーマ: 自動（端末連動）';
+    } else if (widget.themeMode == ThemeMode.dark) {
+      themeIcon = Icons.dark_mode;
+      themeTooltip = 'テーマ: ダーク固定';
+    } else {
+      themeIcon = Icons.light_mode;
+      themeTooltip = 'テーマ: ライト固定';
+    }
+
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 8,
@@ -559,9 +611,9 @@ class _MainScreenState extends State<MainScreen> {
             onPressed: _resetAllTabs,
           ),
           IconButton(
-            icon: Icon(_isDarkNow ? Icons.light_mode : Icons.dark_mode),
-            tooltip: 'テーマ切り替え',
-            onPressed: widget.onToggleTheme,
+            icon: Icon(themeIcon),
+            tooltip: themeTooltip,
+            onPressed: widget.onCycleTheme,
           ),
         ],
         bottom: isTablet
@@ -653,7 +705,7 @@ class _MainScreenState extends State<MainScreen> {
 }
 
 // ----------------------------------------------------
-// 星座モーダル（拡大縮小・パン移動 ＆ 1.5倍サムネイル対応）
+// 星座モーダル（2行折り返し ＆ タップ詳細インフォバー）
 // ----------------------------------------------------
 class StarNode {
   final String title;
@@ -690,6 +742,9 @@ class ConstellationModal extends StatefulWidget {
 class _ConstellationModalState extends State<ConstellationModal> {
   final Map<String, ui.Image> _loadedImages = {};
   final TransformationController _transformCtrl = TransformationController();
+
+  // 現在選択/フォーカスされている星（長文タイトル確認用）
+  StarNode? _focusedNode;
 
   @override
   void initState() {
@@ -737,7 +792,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
     final cy = size.height / 2;
     final isTablet = size.width >= 768;
 
-    // 中心星：1.5倍（22->33, 18->27）
     final centerR = isTablet ? 33.0 : 27.0;
 
     nodes.add(StarNode(
@@ -757,25 +811,24 @@ class _ConstellationModalState extends State<ConstellationModal> {
 
       double baseDist;
       double r;
-      // 周囲星：1.5倍に拡大
       switch (item.type) {
         case NodeType.abstractNode:
           baseDist = minDim * (isTablet ? 0.44 : 0.42);
-          r = isTablet ? 21.0 : 18.0; // 14->21, 12->18
+          r = isTablet ? 21.0 : 18.0;
           break;
         case NodeType.serendipity:
           baseDist = minDim * (isTablet ? 0.36 : 0.34);
-          r = isTablet ? 19.5 : 16.5; // 13->19.5, 11->16.5
+          r = isTablet ? 19.5 : 16.5;
           break;
         case NodeType.concreteNode:
         default:
           baseDist = minDim * (isTablet ? 0.28 : 0.26);
-          r = isTablet ? 18.0 : 15.0; // 12->18, 10->15
+          r = isTablet ? 18.0 : 15.0;
           break;
       }
 
       final rad = (i / count) * math.pi * 2;
-      final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.03);
+      final offset = (i % 2 == 0 ? 1.0 : -1.0) * (minDim * 0.035);
       final dist = baseDist + offset;
 
       final x = cx + math.cos(rad) * dist;
@@ -792,7 +845,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
     return nodes;
   }
 
-  // ズーム・パン後の座標を正確に逆変換してタップ判定
   void _handleTap(Offset globalTapPos, List<StarNode> nodes) {
     final scenePos = _transformCtrl.toScene(globalTapPos);
 
@@ -800,20 +852,34 @@ class _ConstellationModalState extends State<ConstellationModal> {
       if (node.type == NodeType.center) continue;
 
       final dist = (node.position - scenePos).distance;
-      if (dist <= node.radius + 20.0) {
-        widget.onSelectNode(node.title);
-        return;
-      }
+      final isNearStar = dist <= node.radius + 20.0;
 
       final textRect = Rect.fromCenter(
-        center: Offset(node.position.dx, node.position.dy + node.radius + 16.0),
-        width: 120.0,
-        height: 32.0,
+        center: Offset(node.position.dx, node.position.dy + node.radius + 18.0),
+        width: 105.0,
+        height: 38.0,
       );
-      if (textRect.contains(scenePos)) {
-        widget.onSelectNode(node.title);
+      final isNearText = textRect.contains(scenePos);
+
+      if (isNearStar || isNearText) {
+        // すでにフォーカスされている星をもう一度タップした場合はその記事へジャンプ
+        if (_focusedNode?.title == node.title) {
+          widget.onSelectNode(node.title);
+        } else {
+          // 1回目のタップ時はフォーカス（下部バナーにフルタイトル表示）
+          setState(() {
+            _focusedNode = node;
+          });
+        }
         return;
       }
+    }
+
+    // 何もない背景をタップした時はフォーカス解除
+    if (_focusedNode != null) {
+      setState(() {
+        _focusedNode = null;
+      });
     }
   }
 
@@ -844,7 +910,7 @@ class _ConstellationModalState extends State<ConstellationModal> {
                       ),
                       const SizedBox(width: 8),
                       const Text(
-                        '紫:大枠 / 青:深掘 / 橙:意外性 (ピンチで拡大縮小)',
+                        '紫:大枠 / 青:深掘 / 橙:意外性',
                         style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
                       ),
                     ],
@@ -858,38 +924,132 @@ class _ConstellationModalState extends State<ConstellationModal> {
             ),
           ),
           Expanded(
-            child: LayoutBuilder(
-              builder: (ctx, constraints) {
-                final size = Size(constraints.maxWidth, constraints.maxHeight);
-                final nodes = _buildNodes(size);
+            child: Stack(
+              children: [
+                LayoutBuilder(
+                  builder: (ctx, constraints) {
+                    final size = Size(constraints.maxWidth, constraints.maxHeight);
+                    final nodes = _buildNodes(size);
 
-                return InteractiveViewer(
-                  transformationController: _transformCtrl,
-                  minScale: 0.6,
-                  maxScale: 3.5,
-                  boundaryMargin: const EdgeInsets.all(120),
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTapUp: (details) => _handleTap(details.localPosition, nodes),
-                    child: CustomPaint(
-                      size: size,
-                      painter: VisualConstellationPainter(nodes: nodes),
+                    return InteractiveViewer(
+                      transformationController: _transformCtrl,
+                      minScale: 0.6,
+                      maxScale: 3.5,
+                      boundaryMargin: const EdgeInsets.all(120),
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTapUp: (details) => _handleTap(details.localPosition, nodes),
+                        child: CustomPaint(
+                          size: size,
+                          painter: VisualConstellationPainter(
+                            nodes: nodes,
+                            focusedTitle: _focusedNode?.title,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+
+                // 星をタップした時に出現する「詳細タイトル ＆ 遷移ボタン」バナー
+                if (_focusedNode != null)
+                  Positioned(
+                    left: 16,
+                    right: 16,
+                    bottom: 16,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E293B).withValues(alpha: 0.95),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: _getNodeColor(_focusedNode!.type),
+                          width: 1.5,
+                        ),
+                        boxShadow: const [
+                          BoxShadow(color: Colors.black45, blurRadius: 10, offset: Offset(0, 4)),
+                        ],
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  _getNodeTypeName(_focusedNode!.type),
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.bold,
+                                    color: _getNodeColor(_focusedNode!.type),
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  _focusedNode!.title,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: _getNodeColor(_focusedNode!.type),
+                              foregroundColor: Colors.black87,
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            ),
+                            icon: const Icon(Icons.arrow_forward, size: 16),
+                            label: const Text('開く', style: TextStyle(fontWeight: FontWeight.bold)),
+                            onPressed: () => widget.onSelectNode(_focusedNode!.title),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                );
-              },
+              ],
             ),
           ),
         ],
       ),
     );
   }
+
+  Color _getNodeColor(NodeType type) {
+    switch (type) {
+      case NodeType.abstractNode:
+        return const Color(0xFFC084FC);
+      case NodeType.serendipity:
+        return const Color(0xFFFB923C);
+      case NodeType.concreteNode:
+      default:
+        return const Color(0xFF38BDF8);
+    }
+  }
+
+  String _getNodeTypeName(NodeType type) {
+    switch (type) {
+      case NodeType.abstractNode:
+        return '上位概念・背景カテゴリ';
+      case NodeType.serendipity:
+        return '意外な繋がり・派生トピック';
+      case NodeType.concreteNode:
+      default:
+        return '関連詳細・深掘りリンク';
+    }
+  }
 }
 
 class VisualConstellationPainter extends CustomPainter {
   final List<StarNode> nodes;
+  final String? focusedTitle;
 
-  VisualConstellationPainter({required this.nodes});
+  VisualConstellationPainter({required this.nodes, this.focusedTitle});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -901,7 +1061,6 @@ class VisualConstellationPainter extends CustomPainter {
       ..color = const Color(0xFF38BDF8).withValues(alpha: 0.18)
       ..strokeWidth = 1.0;
 
-    // 1. 星座ライン
     for (int i = 1; i < nodes.length; i++) {
       final node = nodes[i];
       canvas.drawLine(center.position, node.position, linePaint);
@@ -913,7 +1072,6 @@ class VisualConstellationPainter extends CustomPainter {
       canvas.drawLine(node.position, next.position, perimeterPaint);
     }
 
-    // 2. 星と画像の描画
     for (final node in nodes) {
       Color themeColor;
       Color glowColor;
@@ -924,24 +1082,36 @@ class VisualConstellationPainter extends CustomPainter {
           glowColor = const Color(0xFF38BDF8).withValues(alpha: 0.25);
           break;
         case NodeType.abstractNode:
-          themeColor = const Color(0xFFC084FC); // 紫
+          themeColor = const Color(0xFFC084FC);
           glowColor = const Color(0xFFA855F7).withValues(alpha: 0.25);
           break;
         case NodeType.serendipity:
-          themeColor = const Color(0xFFFB923C); // 橙（意外性）
+          themeColor = const Color(0xFFFB923C);
           glowColor = const Color(0xFFEA580C).withValues(alpha: 0.25);
           break;
         case NodeType.concreteNode:
         default:
-          themeColor = const Color(0xFF38BDF8); // 水色
+          themeColor = const Color(0xFF38BDF8);
           glowColor = Colors.white.withValues(alpha: 0.10);
           break;
       }
 
-      // 外周グロー（1.5倍の星に合わせて少し広めに）
+      final isFocused = focusedTitle == node.title;
+
+      // 選択中の星は強調リングを描画
+      if (isFocused) {
+        canvas.drawCircle(
+          node.position,
+          node.radius + 9,
+          Paint()
+            ..color = themeColor.withValues(alpha: 0.45)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2.0,
+        );
+      }
+
       canvas.drawCircle(node.position, node.radius + 5, Paint()..color = glowColor);
 
-      // サムネイル画像があれば円形クリップして描画
       if (node.image != null) {
         canvas.save();
         final clipPath = Path()..addOval(Rect.fromCircle(center: node.position, radius: node.radius));
@@ -955,22 +1125,21 @@ class VisualConstellationPainter extends CustomPainter {
         final borderPaint = Paint()
           ..color = themeColor
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.6; // 視認性を高めるため少し太めに
+          ..strokeWidth = isFocused ? 3.5 : 2.6;
         canvas.drawCircle(node.position, node.radius, borderPaint);
       } else {
-        // 画像がない場合のフォールバック（光る星）
         final baseStarPaint = Paint()..color = themeColor;
         canvas.drawCircle(node.position, node.radius, baseStarPaint);
       }
 
-      // ラベルテキスト描画
-      final displayLabel = node.title.length > 8 ? '${node.title.substring(0, 7)}…' : node.title;
+      // 長いタイトル対策：幅95pxで自然に最大2行まで改行し、それを超える場合は「…」でスマートに省略
       final textSpan = TextSpan(
-        text: displayLabel,
+        text: node.title,
         style: TextStyle(
           color: node.type == NodeType.center ? const Color(0xFF38BDF8) : themeColor,
-          fontSize: node.type == NodeType.center ? 14 : 11.5,
-          fontWeight: (node.type == NodeType.center || node.type == NodeType.abstractNode)
+          fontSize: node.type == NodeType.center ? 14 : 11.0,
+          height: 1.15,
+          fontWeight: (node.type == NodeType.center || isFocused || node.type == NodeType.abstractNode)
               ? FontWeight.bold
               : FontWeight.normal,
         ),
@@ -980,11 +1149,13 @@ class VisualConstellationPainter extends CustomPainter {
         text: textSpan,
         textAlign: TextAlign.center,
         textDirection: TextDirection.ltr,
-      )..layout(maxWidth: 130);
+        maxLines: 2,
+        ellipsis: '…',
+      )..layout(maxWidth: 95);
 
       final textOffset = Offset(
         node.position.dx - (textPainter.width / 2),
-        node.position.dy + node.radius + 7.0,
+        node.position.dy + node.radius + 6.0,
       );
 
       textPainter.paint(canvas, textOffset);
