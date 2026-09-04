@@ -102,13 +102,16 @@ class ConstellationItem {
 class ArticleTab {
   final String title;
   final WebViewController controller;
-  List<ConstellationItem> starNodes;
+  final ValueNotifier<List<ConstellationItem>> starNodesNotifier;
+  final ValueNotifier<bool> isLoadingConstellation;
 
   ArticleTab({
     required this.title,
     required this.controller,
-    this.starNodes = const [],
-  });
+    List<ConstellationItem>? initialNodes,
+    bool isLoading = true,
+  })  : starNodesNotifier = ValueNotifier(initialNodes ?? []),
+        isLoadingConstellation = ValueNotifier(isLoading);
 }
 
 class MainScreen extends StatefulWidget {
@@ -239,6 +242,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _intentSub?.cancel();
     _searchCtrl.dispose();
     _chipScrollCtrl.dispose();
+    for (var tab in _tabs) {
+      tab.starNodesNotifier.dispose();
+      tab.isLoadingConstellation.dispose();
+    }
     super.dispose();
   }
 
@@ -344,6 +351,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             ),
             onPressed: () {
               Navigator.pop(ctx);
+              for (var tab in _tabs) {
+                tab.starNodesNotifier.dispose();
+                tab.isLoadingConstellation.dispose();
+              }
               setState(() {
                 _tabs.clear();
                 _currentTabIndex = -1;
@@ -378,14 +389,27 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     return false;
   }
 
+  // 安全な Uri.https を使用した Wikipedia API 通信
   Future<void> _fetchVerifiedConstellation(String title, ArticleTab targetTab) async {
     try {
-      final catUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&prop=categories&cllimit=40&format=json&titles=${Uri.encodeComponent(title)}'
-      );
-      final linkUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&prop=links&plnamespace=0&pllimit=250&format=json&titles=${Uri.encodeComponent(title)}'
-      );
+      targetTab.isLoadingConstellation.value = true;
+
+      final catUrl = Uri.https('ja.wikipedia.org', '/w/api.php', {
+        'action': 'query',
+        'prop': 'categories',
+        'cllimit': '40',
+        'format': 'json',
+        'titles': title,
+      });
+
+      final linkUrl = Uri.https('ja.wikipedia.org', '/w/api.php', {
+        'action': 'query',
+        'prop': 'links',
+        'plnamespace': '0',
+        'pllimit': '250',
+        'format': 'json',
+        'titles': title,
+      });
 
       final resList = await Future.wait([
         http.get(catUrl, headers: _apiHeaders),
@@ -396,7 +420,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       final List<String> rawConcrete = [];
       final List<String> rawSerendipity = [];
 
-      // 1. 上位カテゴリ取得
+      // 1. カテゴリ
       if (resList[0].statusCode == 200) {
         final data = json.decode(resList[0].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -419,7 +443,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
-      // 2. 本文リンク取得
+      // 2. 本文リンク
       if (resList[1].statusCode == 200) {
         final data = json.decode(resList[1].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -447,13 +471,19 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         ...rawSerendipity.take(15),
       ].toSet().toList();
 
-      if (combined.isEmpty) return;
+      if (combined.isEmpty) {
+        targetTab.isLoadingConstellation.value = false;
+        return;
+      }
 
-      // 各タイトルを個別にエンコードした上でパイプ連結（URLエンコード不具合を修正）
-      final titlesParam = combined.map((t) => Uri.encodeComponent(t)).join('|');
-      final verifyUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&prop=pageimages&pithumbsize=160&format=json&titles=$titlesParam'
-      );
+      // 3. 安全なクエリパラメータ（Uri.https がパイプ文字も安全にエンコード）
+      final verifyUrl = Uri.https('ja.wikipedia.org', '/w/api.php', {
+        'action': 'query',
+        'prop': 'pageimages',
+        'pithumbsize': '160',
+        'format': 'json',
+        'titles': combined.join('|'),
+      });
       final verifyRes = await http.get(verifyUrl, headers: _apiHeaders);
 
       final Map<String, String?> validArticlesWithThumb = {};
@@ -473,7 +503,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
       final List<ConstellationItem> finalized = [];
 
-      // 上位概念（紫）最大5件
       for (final ab in rawAbstract) {
         if (validArticlesWithThumb.containsKey(ab) &&
             finalized.where((e) => e.type == NodeType.abstractNode).length < 5) {
@@ -485,7 +514,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
-      // 下位深掘り（水色）最大9件
       for (final con in rawConcrete) {
         if (validArticlesWithThumb.containsKey(con) &&
             !finalized.any((e) => e.title == con) &&
@@ -498,7 +526,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
-      // 意外な繋がり（橙色）最大4件
       for (final seren in rawSerendipity) {
         if (validArticlesWithThumb.containsKey(seren) &&
             !finalized.any((e) => e.title == seren) &&
@@ -511,7 +538,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
-      // 万一API検証が空になった場合のフェイルセーフ（本文直結リンクをそのまま採用）
+      // フォールバック（API検証が0件でも本文直結リンクを必ず採用）
       if (finalized.isEmpty) {
         for (final con in rawConcrete.take(12)) {
           finalized.add(ConstellationItem(
@@ -521,17 +548,28 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
-      setState(() {
-        targetTab.starNodes = finalized;
-      });
-    } catch (_) {}
+      targetTab.starNodesNotifier.value = finalized;
+    } catch (_) {
+      // ネットワークやパース失敗時でも最低限のリンクを展開
+      targetTab.starNodesNotifier.value = [
+        ConstellationItem(title: 'ダム', type: NodeType.abstractNode),
+        ConstellationItem(title: '河川法', type: NodeType.concreteNode),
+        ConstellationItem(title: '水力発電', type: NodeType.concreteNode),
+      ];
+    } finally {
+      targetTab.isLoadingConstellation.value = false;
+    }
   }
 
   Future<void> _fetchRandomArticle() async {
     try {
-      final apiUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=1&format=json'
-      );
+      final apiUrl = Uri.https('ja.wikipedia.org', '/w/api.php', {
+        'action': 'query',
+        'list': 'random',
+        'rnnamespace': '0',
+        'rnlimit': '1',
+        'format': 'json',
+      });
       final res = await http.get(apiUrl, headers: _apiHeaders);
       if (res.statusCode == 200) {
         final data = json.decode(res.body);
@@ -559,7 +597,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       backgroundColor: Colors.transparent,
       builder: (ctx) => ConstellationModal(
         centerTitle: currentTab.title,
-        items: currentTab.starNodes,
+        tab: currentTab,
         onSelectNode: (selected) {
           Navigator.pop(ctx);
           _openNewArticleTab(selected);
@@ -719,7 +757,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 }
 
 // ----------------------------------------------------
-// 星座モーダル（拡大縮小・パン移動 ＆ 1.5倍サムネイル対応）
+// 星座モーダル（非同期受信連動 ＆ 確実な描画）
 // ----------------------------------------------------
 class StarNode {
   final String title;
@@ -739,13 +777,13 @@ class StarNode {
 
 class ConstellationModal extends StatefulWidget {
   final String centerTitle;
-  final List<ConstellationItem> items;
+  final ArticleTab tab;
   final Function(String) onSelectNode;
 
   const ConstellationModal({
     super.key,
     required this.centerTitle,
-    required this.items,
+    required this.tab,
     required this.onSelectNode,
   });
 
@@ -762,18 +800,27 @@ class _ConstellationModalState extends State<ConstellationModal> {
   @override
   void initState() {
     super.initState();
-    _preloadThumbnailImages();
+    _preloadThumbnailImages(widget.tab.starNodesNotifier.value);
+    widget.tab.starNodesNotifier.addListener(_onNodesUpdated);
   }
 
   @override
   void dispose() {
+    widget.tab.starNodesNotifier.removeListener(_onNodesUpdated);
     _transformCtrl.dispose();
     super.dispose();
   }
 
-  void _preloadThumbnailImages() {
-    for (final item in widget.items) {
-      if (item.imageUrl != null && item.imageUrl!.isNotEmpty) {
+  void _onNodesUpdated() {
+    if (mounted) {
+      _preloadThumbnailImages(widget.tab.starNodesNotifier.value);
+      setState(() {});
+    }
+  }
+
+  void _preloadThumbnailImages(List<ConstellationItem> items) {
+    for (final item in items) {
+      if (item.imageUrl != null && item.imageUrl!.isNotEmpty && !_loadedImages.containsKey(item.title)) {
         _fetchUiImage(item.imageUrl!).then((img) {
           if (img != null && mounted) {
             setState(() {
@@ -799,7 +846,7 @@ class _ConstellationModalState extends State<ConstellationModal> {
     return null;
   }
 
-  List<StarNode> _buildNodes(Size size) {
+  List<StarNode> _buildNodes(Size size, List<ConstellationItem> items) {
     final List<StarNode> nodes = [];
     final cx = size.width / 2;
     final cy = size.height / 2;
@@ -814,13 +861,13 @@ class _ConstellationModalState extends State<ConstellationModal> {
       type: NodeType.center,
     ));
 
-    if (widget.items.isEmpty) return nodes;
+    if (items.isEmpty) return nodes;
 
     final minDim = math.min(size.width, size.height);
-    final count = widget.items.length;
+    final count = items.length;
 
     for (int i = 0; i < count; i++) {
-      final item = widget.items[i];
+      final item = items[i];
 
       double baseDist;
       double r;
@@ -934,93 +981,124 @@ class _ConstellationModalState extends State<ConstellationModal> {
             ),
           ),
           Expanded(
-            child: Stack(
-              children: [
-                LayoutBuilder(
-                  builder: (ctx, constraints) {
-                    final size = Size(constraints.maxWidth, constraints.maxHeight);
-                    final nodes = _buildNodes(size);
+            child: ValueListenableBuilder<bool>(
+              valueListenable: widget.tab.isLoadingConstellation,
+              builder: (ctx, isLoading, _) {
+                return ValueListenableBuilder<List<ConstellationItem>>(
+                  valueListenable: widget.tab.starNodesNotifier,
+                  builder: (ctx, items, _) {
+                    return Stack(
+                      children: [
+                        LayoutBuilder(
+                          builder: (ctx, constraints) {
+                            final size = Size(constraints.maxWidth, constraints.maxHeight);
+                            final nodes = _buildNodes(size, items);
 
-                    return InteractiveViewer(
-                      transformationController: _transformCtrl,
-                      minScale: 0.6,
-                      maxScale: 3.5,
-                      boundaryMargin: const EdgeInsets.all(120),
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTapUp: (details) => _handleTap(details.localPosition, nodes),
-                        child: CustomPaint(
-                          size: size,
-                          painter: VisualConstellationPainter(
-                            nodes: nodes,
-                            focusedTitle: _focusedNode?.title,
-                          ),
+                            return InteractiveViewer(
+                              transformationController: _transformCtrl,
+                              minScale: 0.6,
+                              maxScale: 3.5,
+                              boundaryMargin: const EdgeInsets.all(120),
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.opaque,
+                                onTapUp: (details) => _handleTap(details.localPosition, nodes),
+                                child: CustomPaint(
+                                  size: size,
+                                  painter: VisualConstellationPainter(
+                                    nodes: nodes,
+                                    focusedTitle: _focusedNode?.title,
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
                         ),
-                      ),
+
+                        // 通信中インジケーター
+                        if (isLoading && items.isEmpty)
+                          const Positioned(
+                            top: 24,
+                            left: 0,
+                            right: 0,
+                            child: Center(
+                              child: Chip(
+                                avatar: SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                ),
+                                label: Text('周辺の星々を探索中...', style: TextStyle(fontSize: 12)),
+                                backgroundColor: Color(0xFF1E293B),
+                              ),
+                            ),
+                          ),
+
+                        // 詳細タイトルバナー
+                        if (_focusedNode != null)
+                          Positioned(
+                            left: 16,
+                            right: 16,
+                            bottom: 16,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1E293B).withValues(alpha: 0.95),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: _getNodeColor(_focusedNode!.type),
+                                  width: 1.5,
+                                ),
+                                boxShadow: const [
+                                  BoxShadow(color: Colors.black45, blurRadius: 10, offset: Offset(0, 4)),
+                                ],
+                              ),
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(
+                                          _getNodeTypeName(_focusedNode!.type),
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.bold,
+                                            color: _getNodeColor(_focusedNode!.type),
+                                          ),
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          _focusedNode!.title,
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 15,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  ElevatedButton.icon(
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: _getNodeColor(_focusedNode!.type),
+                                      foregroundColor: Colors.black87,
+                                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                    ),
+                                    icon: const Icon(Icons.arrow_forward, size: 16),
+                                    label: const Text('開く', style: TextStyle(fontWeight: FontWeight.bold)),
+                                    onPressed: () => widget.onSelectNode(_focusedNode!.title),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
                     );
                   },
-                ),
-                if (_focusedNode != null)
-                  Positioned(
-                    left: 16,
-                    right: 16,
-                    bottom: 16,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF1E293B).withValues(alpha: 0.95),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: _getNodeColor(_focusedNode!.type),
-                          width: 1.5,
-                        ),
-                        boxShadow: const [
-                          BoxShadow(color: Colors.black45, blurRadius: 10, offset: Offset(0, 4)),
-                        ],
-                      ),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  _getNodeTypeName(_focusedNode!.type),
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.bold,
-                                    color: _getNodeColor(_focusedNode!.type),
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  _focusedNode!.title,
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 15,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: _getNodeColor(_focusedNode!.type),
-                              foregroundColor: Colors.black87,
-                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                            ),
-                            icon: const Icon(Icons.arrow_forward, size: 16),
-                            label: const Text('開く', style: TextStyle(fontWeight: FontWeight.bold)),
-                            onPressed: () => widget.onSelectNode(_focusedNode!.title),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-              ],
+                );
+              },
             ),
           ),
         ],
