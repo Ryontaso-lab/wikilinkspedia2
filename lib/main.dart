@@ -99,15 +99,18 @@ class ConstellationItem {
   });
 }
 
+// 記事タブモデル（メモリ最適化：コントローラーの動的破棄・再生成に対応）
 class ArticleTab {
   final String title;
-  final WebViewController controller;
+  WebViewController? controller; // 生きている時のみ存在。休眠時はnullでRAM解放
+  int savedScrollY;              // 休眠時に保持するしおり（スクロール位置）
   final ValueNotifier<List<ConstellationItem>> starNodesNotifier;
   final ValueNotifier<bool> isLoadingConstellation;
 
   ArticleTab({
     required this.title,
-    required this.controller,
+    this.controller,
+    this.savedScrollY = 0,
     List<ConstellationItem>? initialNodes,
     bool isLoading = true,
   })  : starNodesNotifier = ValueNotifier(initialNodes ?? []),
@@ -124,10 +127,14 @@ class MainScreen extends StatefulWidget {
 }
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
+  // RAM圧迫を防ぐため、生きたWebViewの最大同時保持数を3個に制限
+  static const int _maxActiveWebViews = 3;
+
   final TextEditingController _searchCtrl = TextEditingController();
   final ScrollController _chipScrollCtrl = ScrollController();
 
   final List<ArticleTab> _tabs = [];
+  final List<int> _lruOrder = []; // 最近閲覧されたタブインデックスの履歴（古いものから解放）
   int _currentTabIndex = -1;
 
   StreamSubscription? _intentSub;
@@ -192,10 +199,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   void _applyThemeToAllControllers() {
     for (var tab in _tabs) {
-      if (_isDarkNow) {
-        tab.controller.runJavaScript(_darkModeCss);
-      } else {
-        tab.controller.runJavaScript(_removeDarkCss);
+      if (tab.controller != null) {
+        if (_isDarkNow) {
+          tab.controller!.runJavaScript(_darkModeCss);
+        } else {
+          tab.controller!.runJavaScript(_removeDarkCss);
+        }
       }
     }
   }
@@ -263,15 +272,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _openNewArticleTab(String title) {
-    if (title.isEmpty) return;
-
-    final existingIndex = _tabs.indexWhere((t) => t.title == title);
-    if (existingIndex != -1) {
-      _switchToTab(existingIndex);
-      return;
-    }
-
+  // コントローラーを生成するヘルパー関数
+  WebViewController _createController(String title, {int targetScrollY = 0}) {
     final rawTitle = title.replaceAll(' ', '_');
     final directUrl = 'https://ja.m.wikipedia.org/wiki/${Uri.encodeComponent(rawTitle)}';
 
@@ -297,11 +299,66 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             if (_isDarkNow) {
               ctrl.runJavaScript(_darkModeCss);
             }
+            // 休眠から復帰した記事なら、以前記録したスクロール位置へ復元
+            if (targetScrollY > 0) {
+              Future.delayed(const Duration(milliseconds: 150), () {
+                ctrl.runJavaScript('window.scrollTo({ top: $targetScrollY, behavior: "instant" });');
+              });
+            }
           },
         ),
       )
       ..loadRequest(Uri.parse(directUrl));
 
+    return ctrl;
+  }
+
+  // 生きているWebViewの数を最大3個に保ち、古いものを休眠化（RAM解放）
+  Future<void> _manageMemoryLimit() async {
+    _lruOrder.remove(_currentTabIndex);
+    _lruOrder.add(_currentTabIndex);
+
+    // 生きているタブの個数をカウント
+    final activeIndices = <int>[];
+    for (int i = 0; i < _tabs.length; i++) {
+      if (_tabs[i].controller != null) {
+        activeIndices.add(i);
+      }
+    }
+
+    // 制限（3個）を超えていたら、LRU履歴の一番古いタブから破棄
+    if (activeIndices.length > _maxActiveWebViews) {
+      for (final idx in _lruOrder) {
+        if (idx != _currentTabIndex && _tabs[idx].controller != null) {
+          // 破棄する直前に現在のスクロール座標をしおりとして保存
+          try {
+            final res = await _tabs[idx].controller!.runJavaScriptReturningResult(
+              'Math.round(window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);',
+            );
+            final scrollY = int.tryParse(res.toString()) ?? 0;
+            _tabs[idx].savedScrollY = scrollY;
+          } catch (_) {}
+
+          // コントローラーを破棄してメモリ解放
+          setState(() {
+            _tabs[idx].controller = null;
+          });
+          break; // 1件解放してループ終了
+        }
+      }
+    }
+  }
+
+  void _openNewArticleTab(String title) {
+    if (title.isEmpty) return;
+
+    final existingIndex = _tabs.indexWhere((t) => t.title == title);
+    if (existingIndex != -1) {
+      _switchToTab(existingIndex);
+      return;
+    }
+
+    final ctrl = _createController(title);
     final newTab = ArticleTab(title: title, controller: ctrl);
 
     setState(() {
@@ -309,6 +366,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       _currentTabIndex = _tabs.length - 1;
     });
 
+    _manageMemoryLimit();
     _fetchVerifiedConstellation(title, newTab);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -322,11 +380,35 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     });
   }
 
-  void _switchToTab(int index) {
+  // タブ切り替え（休眠していた場合は保存スクロール位置で再生成）
+  Future<void> _switchToTab(int index) async {
     if (index < 0 || index >= _tabs.length || index == _currentTabIndex) return;
+
+    // 現在閲覧中のタブの最新スクロール位置を同期
+    if (_currentTabIndex >= 0 && _currentTabIndex < _tabs.length) {
+      final curTab = _tabs[_currentTabIndex];
+      if (curTab.controller != null) {
+        try {
+          final res = await curTab.controller!.runJavaScriptReturningResult(
+            'Math.round(window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);',
+          );
+          curTab.savedScrollY = int.tryParse(res.toString()) ?? curTab.savedScrollY;
+        } catch (_) {}
+      }
+    }
+
+    final targetTab = _tabs[index];
+
+    // 休眠していたタブなら再活性化
+    if (targetTab.controller == null) {
+      targetTab.controller = _createController(targetTab.title, targetScrollY: targetTab.savedScrollY);
+    }
+
     setState(() {
       _currentTabIndex = index;
     });
+
+    _manageMemoryLimit();
   }
 
   void _resetAllTabs() {
@@ -357,6 +439,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               }
               setState(() {
                 _tabs.clear();
+                _lruOrder.clear();
                 _currentTabIndex = -1;
               });
               _searchCtrl.clear();
@@ -389,7 +472,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     return false;
   }
 
-  // 安全な Uri.https を使用した Wikipedia API 通信
   Future<void> _fetchVerifiedConstellation(String title, ArticleTab targetTab) async {
     try {
       targetTab.isLoadingConstellation.value = true;
@@ -420,7 +502,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       final List<String> rawConcrete = [];
       final List<String> rawSerendipity = [];
 
-      // 1. カテゴリ
       if (resList[0].statusCode == 200) {
         final data = json.decode(resList[0].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -443,7 +524,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
-      // 2. 本文リンク
       if (resList[1].statusCode == 200) {
         final data = json.decode(resList[1].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -476,7 +556,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         return;
       }
 
-      // 3. 安全なクエリパラメータ（Uri.https がパイプ文字も安全にエンコード）
       final verifyUrl = Uri.https('ja.wikipedia.org', '/w/api.php', {
         'action': 'query',
         'prop': 'pageimages',
@@ -538,7 +617,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
-      // フォールバック（API検証が0件でも本文直結リンクを必ず採用）
       if (finalized.isEmpty) {
         for (final con in rawConcrete.take(12)) {
           finalized.add(ConstellationItem(
@@ -550,7 +628,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
       targetTab.starNodesNotifier.value = finalized;
     } catch (_) {
-      // ネットワークやパース失敗時でも最低限のリンクを展開
       targetTab.starNodesNotifier.value = [
         ConstellationItem(title: 'ダム', type: NodeType.abstractNode),
         ConstellationItem(title: '河川法', type: NodeType.concreteNode),
@@ -747,7 +824,16 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 ? const Center(child: CircularProgressIndicator())
                 : IndexedStack(
                     index: _currentTabIndex,
-                    children: _tabs.map((tab) => WebViewWidget(controller: tab.controller)).toList(),
+                    children: _tabs.map((tab) {
+                      // コントローラーが生きていればWebView、休眠中は空の軽量コンテナ
+                      if (tab.controller != null) {
+                        return WebViewWidget(controller: tab.controller!);
+                      } else {
+                        return const Center(
+                          child: CircularProgressIndicator(),
+                        );
+                      }
+                    }).toList(),
                   ),
           ),
         ],
@@ -757,7 +843,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 }
 
 // ----------------------------------------------------
-// 星座モーダル（非同期受信連動 ＆ 確実な描画）
+// 星座モーダル
 // ----------------------------------------------------
 class StarNode {
   final String title;
@@ -1013,8 +1099,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
                             );
                           },
                         ),
-
-                        // 通信中インジケーター
                         if (isLoading && items.isEmpty)
                           const Positioned(
                             top: 24,
@@ -1032,8 +1116,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
                               ),
                             ),
                           ),
-
-                        // 詳細タイトルバナー
                         if (_focusedNode != null)
                           Positioned(
                             left: 16,
