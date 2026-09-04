@@ -20,7 +20,6 @@ class WikiApp extends StatefulWidget {
 }
 
 class _WikiAppState extends State<WikiApp> with WidgetsBindingObserver {
-  // 初期状態を端末設定追従（system）に設定
   ThemeMode _themeMode = ThemeMode.system;
 
   @override
@@ -35,7 +34,6 @@ class _WikiAppState extends State<WikiApp> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  // 端末のダーク/ライトモード切り替えをリアルタイム検知
   @override
   void didChangePlatformBrightness() {
     super.didChangePlatformBrightness();
@@ -44,7 +42,6 @@ class _WikiAppState extends State<WikiApp> with WidgetsBindingObserver {
     }
   }
 
-  // 自動(system) -> ダーク(dark) -> ライト(light) の3段階トグル
   void cycleTheme() {
     setState(() {
       if (_themeMode == ThemeMode.system) {
@@ -365,7 +362,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     if (title.contains(':') || title.endsWith('の一覧') || title.contains('(曖昧さ回避)')) return true;
 
     final standardPattern = RegExp(
-      r'(ISO|JIS|IEC|RFC|IEEE|DIN|ASTM|GB|工業標準|工業規格|国際標準化機構|コード|識別子|番号体系|仕様書)',
+      r'(ISO|JIS|IEC|RFC|IEEE|DIN|ASTM|GB|工業標準|工業規格|国際標準化機構|識別子|番号体系|仕様書)',
       caseSensitive: false,
     );
     if (standardPattern.hasMatch(title)) return true;
@@ -399,6 +396,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       final List<String> rawConcrete = [];
       final List<String> rawSerendipity = [];
 
+      // 1. 上位カテゴリ取得
       if (resList[0].statusCode == 200) {
         final data = json.decode(resList[0].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -421,6 +419,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
+      // 2. 本文リンク取得
       if (resList[1].statusCode == 200) {
         final data = json.decode(resList[1].body);
         final pages = data['query']?['pages'] as Map<String, dynamic>?;
@@ -432,10 +431,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 .where((t) => !_isJunkOrStandard(t))
                 .toList();
 
-            rawConcrete.addAll(validLinks.take(40));
+            rawConcrete.addAll(validLinks.take(35));
 
-            if (validLinks.length > 40) {
-              final tailLinks = validLinks.skip(40).toList()..shuffle();
+            if (validLinks.length > 35) {
+              final tailLinks = validLinks.skip(35).toList()..shuffle();
               rawSerendipity.addAll(tailLinks.take(20));
             }
           }
@@ -450,8 +449,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
       if (combined.isEmpty) return;
 
+      // 各タイトルを個別にエンコードした上でパイプ連結（URLエンコード不具合を修正）
+      final titlesParam = combined.map((t) => Uri.encodeComponent(t)).join('|');
       final verifyUrl = Uri.parse(
-        'https://ja.wikipedia.org/w/api.php?action=query&prop=pageimages&pithumbsize=160&titles=${Uri.encodeComponent(combined.join('|'))}&format=json'
+        'https://ja.wikipedia.org/w/api.php?action=query&prop=pageimages&pithumbsize=160&format=json&titles=$titlesParam'
       );
       final verifyRes = await http.get(verifyUrl, headers: _apiHeaders);
 
@@ -472,6 +473,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
       final List<ConstellationItem> finalized = [];
 
+      // 上位概念（紫）最大5件
       for (final ab in rawAbstract) {
         if (validArticlesWithThumb.containsKey(ab) &&
             finalized.where((e) => e.type == NodeType.abstractNode).length < 5) {
@@ -483,6 +485,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
+      // 下位深掘り（水色）最大9件
       for (final con in rawConcrete) {
         if (validArticlesWithThumb.containsKey(con) &&
             !finalized.any((e) => e.title == con) &&
@@ -495,6 +498,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         }
       }
 
+      // 意外な繋がり（橙色）最大4件
       for (final seren in rawSerendipity) {
         if (validArticlesWithThumb.containsKey(seren) &&
             !finalized.any((e) => e.title == seren) &&
@@ -503,6 +507,16 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             title: seren,
             type: NodeType.serendipity,
             imageUrl: validArticlesWithThumb[seren],
+          ));
+        }
+      }
+
+      // 万一API検証が空になった場合のフェイルセーフ（本文直結リンクをそのまま採用）
+      if (finalized.isEmpty) {
+        for (final con in rawConcrete.take(12)) {
+          finalized.add(ConstellationItem(
+            title: con,
+            type: NodeType.concreteNode,
           ));
         }
       }
@@ -705,7 +719,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 }
 
 // ----------------------------------------------------
-// 星座モーダル（2行折り返し ＆ タップ詳細インフォバー）
+// 星座モーダル（拡大縮小・パン移動 ＆ 1.5倍サムネイル対応）
 // ----------------------------------------------------
 class StarNode {
   final String title;
@@ -743,7 +757,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
   final Map<String, ui.Image> _loadedImages = {};
   final TransformationController _transformCtrl = TransformationController();
 
-  // 現在選択/フォーカスされている星（長文タイトル確認用）
   StarNode? _focusedNode;
 
   @override
@@ -862,11 +875,9 @@ class _ConstellationModalState extends State<ConstellationModal> {
       final isNearText = textRect.contains(scenePos);
 
       if (isNearStar || isNearText) {
-        // すでにフォーカスされている星をもう一度タップした場合はその記事へジャンプ
         if (_focusedNode?.title == node.title) {
           widget.onSelectNode(node.title);
         } else {
-          // 1回目のタップ時はフォーカス（下部バナーにフルタイトル表示）
           setState(() {
             _focusedNode = node;
           });
@@ -875,7 +886,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
       }
     }
 
-    // 何もない背景をタップした時はフォーカス解除
     if (_focusedNode != null) {
       setState(() {
         _focusedNode = null;
@@ -950,8 +960,6 @@ class _ConstellationModalState extends State<ConstellationModal> {
                     );
                   },
                 ),
-
-                // 星をタップした時に出現する「詳細タイトル ＆ 遷移ボタン」バナー
                 if (_focusedNode != null)
                   Positioned(
                     left: 16,
@@ -1098,7 +1106,6 @@ class VisualConstellationPainter extends CustomPainter {
 
       final isFocused = focusedTitle == node.title;
 
-      // 選択中の星は強調リングを描画
       if (isFocused) {
         canvas.drawCircle(
           node.position,
@@ -1132,7 +1139,6 @@ class VisualConstellationPainter extends CustomPainter {
         canvas.drawCircle(node.position, node.radius, baseStarPaint);
       }
 
-      // 長いタイトル対策：幅95pxで自然に最大2行まで改行し、それを超える場合は「…」でスマートに省略
       final textSpan = TextSpan(
         text: node.title,
         style: TextStyle(
